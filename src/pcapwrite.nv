@@ -1,0 +1,453 @@
+// pcapwrite.nv — capture files as octets.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A WRITER RETURNS OCTETS.  It does not take a file, it does not take
+// a writer and it does not print: a library does not decide for the
+// program that embeds it that something appears anywhere.  What comes
+// back is a `[u8]` the caller writes, pipes, hashes or throws away.
+//
+// THE CAPTURED LENGTH IS NOT A FIELD A CALLER SETS
+//
+// Both formats write a captured length beside the octets, and the two
+// disagreeing is the commonest way a hand-written capture writer
+// produces a file no tool will read: every reader takes the length
+// field and walks to the wrong place, and the next block is nonsense.
+// So `PcapOutPacket` has no captured length.  It holds the octets,
+// and their count IS the captured length wherever one is written.
+// The field that can be wrong does not exist.
+//
+// The ORIGINAL length is still a caller's to state, because only the
+// caller knows how long the packet was before the capture cut it.  It
+// is checked: an original length below the captured one is
+// `PcapUnwritable`, since that would say more octets were saved than
+// were ever on the wire.
+//
+// THE TRAILING LENGTH IS WRITTEN IN ONE PLACE
+//
+// Every pcapng block ends with a second copy of its total length, and
+// leaving it out or getting it wrong produces a file that reads
+// forwards and is unwalkable backwards — which nothing notices until
+// somebody opens the last thousand packets of a large capture.
+// `pcapwrite.block` is the only function here that emits block
+// framing, and every other pcapng writer goes through it.
+//
+// THERE IS NO CLOCK
+//
+// Every timestamp written by this module arrives as an argument.  A
+// capture file says when packets were seen; a writer that stamped
+// `now` would be saying when the file was assembled, which is a
+// different number and usually a wrong one.  The by-product is that
+// rewriting a capture — filtering it, splitting it, converting it
+// between the two formats — carries the original instants through
+// exactly.
+
+// A packet on its way out: what was on the wire, and the octets that
+// were kept.
+//
+// ```novo
+// use pcapwrite
+// use pcapts
+//
+// fn main() [io]
+//     let p = pcapwrite.out_packet(0, pcapts.timestamp(0), 1514, list.zeros(96))
+//     println("${p.original_length}")                 // 1514
+// ```
+pub struct PcapOutPacket
+    // Which interface of the section captured it.  Written by an
+    // Enhanced Packet Block, ignored by a classic record and by a
+    // Simple Packet Block, neither of which has the field.
+    interface_id: Int
+    // When, as a count of ticks at the interface's resolution.
+    // Ignored by a Simple Packet Block, which has no timestamp.
+    timestamp: PcapTimestamp
+    // How many octets were on the wire before the capture cut it.
+    // Equal to the payload's length for a packet that was not cut.
+    original_length: Int
+    // The octets that were kept.  Their count is the captured length
+    // wherever one is written, so the two can never disagree.
+    payload: [u8]
+
+// A packet that may have been cut short by a snapshot length.
+//
+// ```novo
+// use pcapwrite
+// use pcapts
+//
+// fn main() [io]
+//     let p = pcapwrite.out_packet(0, pcapts.timestamp(1700000000000000),
+//                                  1514, list.zeros(96))
+//     println("${list.len(p.payload)}")               // 96
+// ```
+pub fn out_packet(interface_id: Int, t: PcapTimestamp, original_length: Int,
+                  payload: [u8]) -> PcapOutPacket
+    todo("pcapfile-nv.pcapwrite.out_packet")
+
+// A packet that was captured whole: the original length is the
+// payload's length.
+//
+// The common case, spelled so that a caller with a complete frame
+// does not have to state the same number twice and cannot state it
+// twice differently.
+//
+// ```novo
+// use pcapwrite
+// use pcapts
+//
+// fn main() [io]
+//     let p = pcapwrite.whole_packet(0, pcapts.timestamp(0), list.zeros(60))
+//     println("${p.original_length}")                 // 60
+// ```
+pub fn whole_packet(interface_id: Int, t: PcapTimestamp, payload: [u8]) -> PcapOutPacket
+    todo("pcapfile-nv.pcapwrite.whole_packet")
+
+// A classic pcap file's 24-octet header.
+//
+// The byte order and the timestamp resolution both come from the
+// header's magic, so there is nothing else to pass and nothing that
+// can be passed inconsistently.
+//
+// ```novo
+// use pcapwrite
+// use pcaphdr
+// use pcaplink
+//
+// fn main() [io]
+//     let h = pcaphdr.file_header(PcapMagicMicrosecondSwapped, 262144,
+//                                 PcapLinkEthernet)
+//     match pcapwrite.classic_header(h)
+//         Ok(b)  => println("${list.len(b)}")          // 24
+//         Err(e) => println(e.message())
+// ```
+pub fn classic_header(h: PcapFileHeader) -> Result<[u8], PcapError>
+    todo("pcapfile-nv.pcapwrite.classic_header")
+
+// One classic pcap record: a 16-octet header and the octets, with no
+// padding.
+//
+// A classic record is NOT padded — that is a pcapng rule and applying
+// it here produces a file every reader walks off the end of.  The
+// header is four 32-bit fields: the seconds, the fraction, the
+// captured length and the original length.
+//
+// `PcapUnwritable` when the original length is below the payload's
+// length, and when any field is above 0xFFFFFFFF.
+//
+// ```novo
+// use pcapwrite
+// use pcaphdr
+// use pcapbyte
+// use pcapts
+//
+// fn main() [io]
+//     let p = pcapwrite.whole_packet(0, pcapts.timestamp(0), list.zeros(60))
+//     match pcapwrite.classic_record(p, PcapLittleEndian, pcapts.micros())
+//         Ok(b)  => println("${list.len(b)}")          // 76
+//         Err(e) => println(e.message())
+// ```
+pub fn classic_record(p: PcapOutPacket, ord: PcapByteOrder,
+                      r: PcapResolution) -> Result<[u8], PcapError>
+    todo("pcapfile-nv.pcapwrite.classic_record")
+
+// A whole classic pcap file: the header and every packet.
+//
+// The one call for a caller that holds a capture in memory and wants
+// a file.  A caller streaming a capture uses `classic_header` once
+// and `classic_record` per packet, and never holds more than one.
+//
+// `PcapUnwritable` when the header's magic is at a resolution the
+// classic format cannot express, and for every refusal
+// `classic_record` makes.
+//
+// ```novo
+// use pcapwrite
+// use pcaphdr
+// use pcaplink
+//
+// fn main() [io]
+//     let h = pcaphdr.file_header(PcapMagicMicrosecondSwapped, 262144,
+//                                 PcapLinkEthernet)
+//     match pcapwrite.classic_file(h, [])
+//         Ok(b)  => println("${list.len(b)}")          // 24
+//         Err(e) => println(e.message())
+// ```
+pub fn classic_file(h: PcapFileHeader, packets: [PcapOutPacket]) -> Result<[u8], PcapError>
+    todo("pcapfile-nv.pcapwrite.classic_file")
+
+// One pcapng block: the type, the total length, the body, the padding
+// to a 32-bit boundary, and the total length again.
+//
+// THE ONLY FUNCTION HERE THAT EMITS BLOCK FRAMING.  Every other
+// pcapng writer in this module builds a body and hands it to this
+// one, so the trailing length copy and the padding are written once
+// and cannot be left out of a block somebody adds later.
+//
+// `PcapUnwritable` when the resulting total length is above
+// 0xFFFFFFFF.
+//
+// ```novo
+// use pcapwrite
+// use pcapngblock
+// use pcapbyte
+//
+// fn main() [io]
+//     match pcapwrite.block(PcapngSimplePacket, list.zeros(8), PcapLittleEndian)
+//         Ok(b)  => println("${list.len(b)}")          // 20
+//         Err(e) => println(e.message())
+// ```
+pub fn block(kind: PcapngBlockType, body: [u8], ord: PcapByteOrder) -> Result<[u8], PcapError>
+    todo("pcapfile-nv.pcapwrite.block")
+
+// An options list, ending with the `opt_endofopt` the format
+// requires.
+//
+// Each option is its code, its length, its value and its padding to a
+// 32-bit boundary — and the length counts the value and not the
+// padding, which is the arithmetic that goes wrong by hand at the
+// first one-octet option.
+//
+// An EMPTY list writes NO octets at all, not a bare end marker: a
+// block with no options has no options area, and a writer that
+// emitted four octets for one would add four octets to every packet
+// in the file.
+//
+// `PcapUnwritable` for an option value longer than 65535 octets,
+// which is what the 16-bit length field can say.
+//
+// ```novo
+// use pcapwrite
+// use pcapngopt
+// use pcapbyte
+//
+// fn main() [io]
+//     match pcapwrite.options([pcapngopt.option(9, list.zeros(1))], PcapBigEndian)
+//         Ok(b)  => println("${list.len(b)}")          // 12
+//         Err(e) => println(e.message())
+// ```
+pub fn options(opts: [PcapngOption], ord: PcapByteOrder) -> Result<[u8], PcapError>
+    todo("pcapfile-nv.pcapwrite.options")
+
+// The padding that follows a run of octets, to the next 32-bit
+// boundary: zero, one, two or three zero octets.
+//
+// Exposed because a caller assembling a Custom Block's private data
+// needs the same rule, and because a reader checking a file written
+// elsewhere wants to compute what should have been there.
+//
+// ```novo
+// use pcapwrite
+//
+// fn main() [io]
+//     println("${list.len(pcapwrite.padding(13))}")    // 3
+// ```
+pub fn padding(length: Int) -> [u8]
+    todo("pcapfile-nv.pcapwrite.padding")
+
+// A Section Header Block.
+//
+// The section's own byte order is what the block is written in, and
+// the Byte-Order Magic is written in it — which is what makes the
+// block self-describing and why no order argument is taken here.
+//
+// A section length of `None` writes the -1 that means "the writer did
+// not know", which is what a program still writing should write: a
+// number that was right when the header was emitted and wrong by the
+// end is worse than no number.
+//
+// ```novo
+// use pcapwrite
+// use pcapngblock
+// use pcapbyte
+//
+// fn main() [io]
+//     let s = pcapngblock.section(PcapLittleEndian, 1, 0, None, [], 0)
+//     match pcapwrite.section_header(s)
+//         Ok(b)  => println("${list.len(b)}")          // 28
+//         Err(e) => println(e.message())
+// ```
+pub fn section_header(s: PcapngSection) -> Result<[u8], PcapError>
+    todo("pcapfile-nv.pcapwrite.section_header")
+
+// An Interface Description Block.
+//
+// The interface's `resolution`, `offset_seconds`, `name`,
+// `description` and `fcs_length` are written as the options the
+// specification defines for them, and an option is omitted when its
+// value is the specification's default — so an interface at
+// microsecond resolution writes no `if_tsresol`, which is what every
+// other writer does and what keeps a round trip through this package
+// octet-for-octet stable.
+//
+// The interface's `id` is not written: an interface's identifier is
+// its position among the section's Interface Description Blocks, so
+// writing them in identifier order is what assigns it.
+//
+// ```novo
+// use pcapwrite
+// use pcapngblock
+// use pcaplink
+// use pcapbyte
+//
+// fn main() [io]
+//     let i = pcapngblock.interface(0, PcapLinkEthernet, 262144, [])
+//     match pcapwrite.interface_description(i, PcapLittleEndian)
+//         Ok(b)  => println("${list.len(b)}")          // 20
+//         Err(e) => println(e.message())
+// ```
+pub fn interface_description(i: PcapngInterface, ord: PcapByteOrder) -> Result<[u8], PcapError>
+    todo("pcapfile-nv.pcapwrite.interface_description")
+
+// An Enhanced Packet Block.
+//
+// The body is the interface identifier, the timestamp's two 32-bit
+// halves, the captured length, the original length, the octets,
+// padding to a 32-bit boundary, and then the options.  The padding is
+// NOT counted in the captured length and IS counted in the block's
+// total length, which is the pcapng rule that most often goes wrong
+// by hand.
+//
+// `r` is the interface's resolution, which the timestamp's ticks are
+// already in; it is taken so that the writer can refuse a count the
+// interface cannot express rather than writing a silently wrong
+// instant.
+//
+// ```novo
+// use pcapwrite
+// use pcapbyte
+// use pcapts
+//
+// fn main() [io]
+//     let p = pcapwrite.whole_packet(0, pcapts.timestamp(0), list.zeros(60))
+//     match pcapwrite.enhanced_packet(p, [], PcapLittleEndian, pcapts.micros())
+//         Ok(b)  => println("${list.len(b)}")          // 92
+//         Err(e) => println(e.message())
+// ```
+pub fn enhanced_packet(p: PcapOutPacket, opts: [PcapngOption], ord: PcapByteOrder,
+                       r: PcapResolution) -> Result<[u8], PcapError>
+    todo("pcapfile-nv.pcapwrite.enhanced_packet")
+
+// A Simple Packet Block.
+//
+// The body is the original length, the octets and the padding, and
+// nothing else — no interface, no timestamp, no captured length, no
+// options.  The packet's `interface_id` and `timestamp` are dropped,
+// and that is the block's whole purpose: it is four octets of body
+// for a writer that has nothing else to say.
+//
+// `PcapUnwritable` when the payload is shorter than the original
+// length, because a Simple Packet Block cannot record a truncation: a
+// reader derives the captured length from the block's total length
+// and would read the padding as packet octets.  A caller with a
+// truncated packet writes an Enhanced Packet Block.
+//
+// ```novo
+// use pcapwrite
+// use pcapbyte
+// use pcapts
+//
+// fn main() [io]
+//     let p = pcapwrite.whole_packet(0, pcapts.timestamp(0), list.zeros(60))
+//     match pcapwrite.simple_packet(p, PcapLittleEndian)
+//         Ok(b)  => println("${list.len(b)}")          // 76
+//         Err(e) => println(e.message())
+// ```
+pub fn simple_packet(p: PcapOutPacket, ord: PcapByteOrder) -> Result<[u8], PcapError>
+    todo("pcapfile-nv.pcapwrite.simple_packet")
+
+// A Name Resolution Block.
+//
+// Each record is its type, its length, the address, the names
+// NUL-separated, and padding; the list ends with a record of type 0
+// and length 0, and the block's options follow it.
+//
+// `PcapUnwritable` for an IPv4 record whose address is not four
+// octets and an IPv6 record whose address is not sixteen.
+//
+// ```novo
+// use pcapwrite
+// use pcapngblock
+// use pcapbyte
+//
+// fn main() [io]
+//     let n = pcapngblock.name_resolution([], [])
+//     match pcapwrite.name_resolution(n, PcapLittleEndian)
+//         Ok(b)  => println("${list.len(b)}")          // 16
+//         Err(e) => println(e.message())
+// ```
+pub fn name_resolution(n: PcapngNameResolution, ord: PcapByteOrder) -> Result<[u8], PcapError>
+    todo("pcapfile-nv.pcapwrite.name_resolution")
+
+// An Interface Statistics Block.
+//
+// The body is the interface identifier, the timestamp's two halves,
+// and the options that carry every count.
+//
+// ```novo
+// use pcapwrite
+// use pcapngblock
+// use pcapbyte
+// use pcapts
+//
+// fn main() [io]
+//     let s = pcapngblock.statistics(0, pcapts.timestamp(0), [])
+//     match pcapwrite.interface_statistics(s, PcapLittleEndian)
+//         Ok(b)  => println("${list.len(b)}")          // 24
+//         Err(e) => println(e.message())
+// ```
+pub fn interface_statistics(s: PcapngStatistics, ord: PcapByteOrder) -> Result<[u8], PcapError>
+    todo("pcapfile-nv.pcapwrite.interface_statistics")
+
+// A Custom Block.
+//
+// The body is the Private Enterprise Number and then the data, which
+// this package does not look at.  `copiable` picks the block type:
+// 0x00000BAD for content a rewriter may carry into a new file, and
+// 0x40000BAD for content it may not.
+//
+// The `data_length` and `data_at` of the `PcapngCustom` are ignored;
+// the data passed here is what is written.
+//
+// ```novo
+// use pcapwrite
+// use pcapngblock
+// use pcapbyte
+//
+// fn main() [io]
+//     let c = pcapngblock.custom(32473, true, 0, 0)
+//     match pcapwrite.custom_block(c, list.zeros(8), PcapLittleEndian)
+//         Ok(b)  => println("${list.len(b)}")          // 24
+//         Err(e) => println(e.message())
+// ```
+pub fn custom_block(c: PcapngCustom, data: [u8], ord: PcapByteOrder) -> Result<[u8], PcapError>
+    todo("pcapfile-nv.pcapwrite.custom_block")
+
+// A whole one-section pcapng file: the section header, the
+// interfaces in identifier order, and every packet as an Enhanced
+// Packet Block.
+//
+// The one call for a caller that holds a capture in memory.  A caller
+// streaming a capture, or one writing more than one section, uses the
+// per-block functions.
+//
+// `PcapNoSuchInterface` for a packet naming an interface the
+// interface list does not describe — which is the mistake that
+// produces a pcapng file no reader can decode the packets of, and the
+// only one this convenience can catch that the per-block functions
+// cannot.
+//
+// ```novo
+// use pcapwrite
+// use pcapngblock
+// use pcaplink
+// use pcapbyte
+//
+// fn main() [io]
+//     let s = pcapngblock.section(PcapLittleEndian, 1, 0, None, [], 0)
+//     let i = pcapngblock.interface(0, PcapLinkEthernet, 262144, [])
+//     match pcapwrite.ng_file(s, [i], [])
+//         Ok(b)  => println("${list.len(b)}")          // 48
+//         Err(e) => println(e.message())
+// ```
+pub fn ng_file(s: PcapngSection, ifaces: [PcapngInterface],
+               packets: [PcapOutPacket]) -> Result<[u8], PcapError>
+    todo("pcapfile-nv.pcapwrite.ng_file")

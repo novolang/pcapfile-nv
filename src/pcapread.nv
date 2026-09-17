@@ -1,0 +1,515 @@
+// pcapread.nv — the load-bearing interface: one reader for both
+// capture formats, which owns no file and copies no payload.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// FEED AND DRAIN
+//
+// This is a `core` package, so its budget is no effects at all: it
+// may not open a file, seek in one, or wait for a pipe.  A capture
+// file is also the thing nobody can afford to hold — a day of traffic
+// is tens of gigabytes — and the octets arrive from a file, from a
+// pipe, from a socket carrying `tcpdump -w -`, or out of a
+// decompressor.
+//
+// Those facts are reconciled by a FEED-AND-DRAIN STATE MACHINE.  The
+// host reads whatever it can and hands it over; the reader hands back
+// every event those octets completed.
+//
+//     var r = pcapread.reader(pcapread.default_limits())
+//     let fed = pcapread.feed(r, chunk)!
+//     // fed.events is everything this chunk finished
+//     r = fed.reader
+//
+// ONE CALL RETURNS EVERY EVENT, WHICH IS NOT AN ARBITRARY CHOICE
+//
+// A codec that answers one event per call, and a second call to get
+// the next, is the ordinary shape and it is the wrong one here.  A
+// payload event names octets INSIDE THE CHUNK THE CALLER JUST PASSED;
+// a second call that produced another such event would be naming
+// octets from a chunk it was never given.  So `feed` drains, the
+// spans in its result all point into the one chunk, and they are
+// valid for exactly as long as the caller keeps it.
+//
+// WHAT THE READER HOLDS, AND WHAT IT NEVER HOLDS
+//
+// It holds a partial block header, a partial record header, and the
+// body of a block it decodes whole — a section header, an interface
+// description, a name resolution block, a statistics block.  All of
+// those are small and all of them are bounded by `PcapLimits`.
+//
+// It NEVER holds a payload.  A packet split across three chunks
+// arrives as three `PcapBytes` events over three calls, which is the
+// same shape `h1read` gives an HTTP body, and for the same reason: a
+// reader that accumulated would put the largest object in the file
+// into the memory of a program that had already decided not to keep
+// it.
+//
+// BOTH FORMATS DRAIN INTO ONE STREAM OF PACKETS
+//
+// A classic record, an Enhanced Packet Block and a Simple Packet
+// Block all arrive as `PcapPacketStart`, some `PcapBytes`, and a
+// `PcapBodyDone`.  A program that counts packets, filters them or
+// hands them to packet-nv is written once and reads both formats.
+// What differs between them is in `PcapPacket.origin`, and it is
+// there for the programs that must care — a Simple Packet Block has
+// no timestamp, and a rewriter needs to know that.
+//
+// AN OPTIONS LIST ARRIVES AFTER THE PAYLOAD IT DESCRIBES
+//
+// An Enhanced Packet Block writes its options AFTER its octets, so
+// `epb_flags`, `epb_dropcount` and `epb_verdict` are not known when
+// the payload is handed over.  They arrive on `PcapBodyDone`.  A
+// program that needs a packet's direction before it looks at the
+// packet has to buffer it itself — the format made that choice, and a
+// reader that pretended otherwise would be the one buffering.
+
+// What the caller will not let a reader grow past.
+//
+// Every one of these exists because the unbounded version is a
+// denial of service, or a crash, that costs an attacker one corrupt
+// length field: a Section Header Block claiming four gigabytes of
+// options, an Interface Description Block with a million of them, a
+// record header claiming a captured length of 0xFFFFFFFF.  A capture
+// file is a file from somewhere else, and a length field in one is
+// not a promise.
+//
+// They are a value the caller owns rather than constants this package
+// chose, because a tool on a workstation and a tool on a probe want
+// numbers three orders of magnitude apart.
+//
+// ```novo
+// use pcapread
+//
+// fn main() [io]
+//     println("${pcapread.default_limits().max_captured}")
+// ```
+pub struct PcapLimits
+    // The largest captured length a record header or a packet block
+    // may claim.  Exceeding it is `PcapCapturedTooLarge`.  It bounds
+    // what the reader will WALK, not what it holds — the payload is
+    // never held — so it is the check that stops a corrupt length
+    // from swallowing the rest of the file as one packet.
+    max_captured: Int
+    // The largest block the reader will buffer whole.  It applies to
+    // the blocks the reader decodes — the section header, the
+    // interface description, the name resolution and the statistics
+    // blocks — and NOT to packet blocks, whose payload is never held.
+    // Exceeding it is `PcapBlockTooLarge`.
+    max_block: Int
+    // The most options one block may carry.  Exceeding it is
+    // `PcapTooManyOptions`.
+    max_options: Int
+    // The most Interface Description Blocks one section may carry.
+    // The interface table is the one thing the reader keeps for the
+    // length of a section, so it is the one thing a file can make it
+    // grow.
+    max_interfaces: Int
+
+// One thing that came out of a reader.
+//
+// ```novo
+// use pcapread
+//
+// fn main() [io]
+//     let r = pcapread.reader(pcapread.default_limits())
+//     match pcapread.feed(r, list.zeros(4))
+//         Ok(fed) => println("${list.len(fed.events)}")
+//         Err(e)  => println(e.message())
+// ```
+pub enum PcapEvent
+    // A classic pcap file's 24-octet header.  Once per stream, first,
+    // and only from a classic file.
+    PcapClassicFile(header: PcapFileHeader)
+    // A pcapng Section Header Block.  A file may hold several, and
+    // each one resets the byte order and empties the interface table.
+    PcapSection(section: PcapngSection)
+    // A pcapng Interface Description Block, with its identifier
+    // already assigned from its position in the section.
+    PcapInterface(iface: PcapngInterface)
+    // A packet's header.  Its captured octets follow as `PcapBytes`
+    // and its end is `PcapBodyDone`, even when the captured length is
+    // zero and there are no `PcapBytes` at all.
+    PcapPacketStart(packet: PcapPacket)
+    // A pcapng Custom Block's header.  Its private data follows as
+    // `PcapBytes` and its end is `PcapBodyDone`, exactly as a
+    // packet's does, because a custom block's data may be any size
+    // and this package will not hold it either.
+    PcapCustomStart(custom: PcapngCustom)
+    // Some of the current packet's or custom block's octets, as a
+    // span into the chunk that was just fed.  NOT a whole packet and
+    // not a whole anything: how many of these a packet produces is an
+    // artefact of how the host read its file.  A caller that treated
+    // one as a whole packet has written a bug that works on a small
+    // capture.
+    PcapBytes(span: PcapSpan)
+    // The current packet or custom block is complete.  `options` is
+    // an Enhanced Packet Block's options, which the format writes
+    // after the payload; it is empty for a classic record, for a
+    // Simple Packet Block and for a Custom Block.
+    PcapBodyDone(options: [PcapngOption])
+    // A pcapng Name Resolution Block, decoded whole.
+    PcapNames(names: PcapngNameResolution)
+    // A pcapng Interface Statistics Block, decoded whole.
+    PcapStatistics(stats: PcapngStatistics)
+    // A block this package does not decode — the obsolete Packet
+    // Block, or a type it has never heard of — stepped over by its
+    // total length.  It is an EVENT and not silence, because a
+    // program rewriting a capture has to know what it is dropping.
+    PcapSkipped(block: PcapngBlock)
+    // The stream ended between blocks, which is a complete file.
+    // Only from `pcapread.finish`.
+    PcapStreamEnd
+
+// A reader and everything one call produced.
+//
+// ```novo
+// use pcapread
+//
+// fn main() [io]
+//     let r = pcapread.reader(pcapread.embedded_limits())
+//     match pcapread.feed(r, list.zeros(24))
+//         Ok(fed) => println("${pcapread.offset(fed.reader)}")
+//         Err(e)  => println(e.message())
+// ```
+pub struct PcapFed
+    // The reader to use for the next call.  The one that was passed
+    // in is spent.
+    reader: PcapReader
+    // Every event this call completed, in the order the file wrote
+    // them.  Empty when the chunk was a prefix of something, which on
+    // a socket is the ordinary case and is not a fault.
+    //
+    // Every `PcapBytes` span in here points into the chunk that was
+    // passed to this call, and into no other.
+    events: [PcapEvent]
+    // How many octets of the chunk the reader consumed.  Less than
+    // the chunk's length only when a limit stopped it, which is
+    // always an error, so on a success this is the whole chunk.
+    consumed: Int
+
+// The state between "some octets turned up" and "here are the
+// packets".
+//
+// Opaque: the fields are here because a struct needs them, and a
+// caller that reaches into one has coupled itself to a buffering
+// decision this package intends to change.  `pcapread.offset`,
+// `pcapread.pending_len`, `pcapread.format` and
+// `pcapread.interfaces` are the facts about a reader that are
+// anybody's business.
+pub struct PcapReader
+    limits: PcapLimits
+    pending: [u8]
+    consumed: Int
+    interfaces: [PcapngInterface]
+
+// A snapshot length of 262144, a block of 16 MiB, 1024 options and
+// 256 interfaces.
+//
+// The snapshot length is libpcap's own default since 2013, and the
+// rest are an order of magnitude above anything a real capture
+// carries.  A tool on a workstation takes these; a tool that reads
+// files from strangers should take smaller ones and say what it did.
+//
+// ```novo
+// use pcapread
+//
+// fn main() [io]
+//     println("${pcapread.default_limits().max_interfaces}")    // 256
+// ```
+pub fn default_limits() -> PcapLimits
+    todo("pcapfile-nv.pcapread.default_limits")
+
+// A snapshot length of 2048, a block of 8 KiB, 32 options and 4
+// interfaces.
+//
+// Named rather than left to each device caller to invent, because the
+// number that matters on a microcontroller is the one that fits
+// beside everything else in 64 KiB of RAM, and every caller inventing
+// it separately gets a different answer.
+//
+// ```novo
+// use pcapread
+//
+// fn main() [io]
+//     println("${pcapread.embedded_limits().max_captured}")     // 2048
+// ```
+pub fn embedded_limits() -> PcapLimits
+    todo("pcapfile-nv.pcapread.embedded_limits")
+
+// A reader holding nothing, which has not yet seen a magic number.
+//
+// It does not know which format it is reading until the first four
+// octets arrive, which is the point: a caller does not have to know
+// either, and a tool that accepts both formats is written once.
+//
+// ```novo
+// use pcapread
+//
+// fn main() [io]
+//     let r = pcapread.reader(pcapread.default_limits())
+//     println("${pcapread.pending_len(r)}")          // 0
+// ```
+pub fn reader(limits: PcapLimits) -> PcapReader
+    todo("pcapfile-nv.pcapread.reader")
+
+// Adds octets and returns every event they completed.
+//
+// THE FUNCTION THE PACKAGE IS FOR.  The chunk may be any size, may
+// split any structure at any octet, and may be empty.  The events
+// come back in the order the file wrote them.
+//
+// Every `PcapBytes` span in the result indexes THE CHUNK PASSED TO
+// THIS CALL.  The caller must read them before it makes the next
+// call, and must not assume they survive it.  That is the whole of
+// the no-copy contract, and it is what lets packet-nv parse a
+// capture at the speed of the disk.
+//
+// ```novo
+// use pcapread
+// use pcaphdr
+//
+// fn main() [io]
+//     var r = pcapread.reader(pcapread.default_limits())
+//     let chunk = pcaphdr.magic_bytes(PcapMagicMicrosecondSwapped)
+//     match pcapread.feed(r, chunk)
+//         Ok(fed) => println("${list.len(fed.events)}")   // 0: a prefix
+//         Err(e)  => println(e.message())
+// ```
+pub fn feed(r: PcapReader, chunk: [u8]) -> Result<PcapFed, PcapError>
+    todo("pcapfile-nv.pcapread.feed")
+
+// Tells the reader the stream ended, and returns what that completed.
+//
+// This is not a formality.  A file that ends between blocks is a
+// complete capture and answers `PcapStreamEnd`; a file that ends in
+// the middle of one is `PcapTruncated`, which is what a killed
+// `tcpdump` and a full disk both produce.  A reader that was never
+// told cannot tell those apart, and a tool that skipped this call
+// reports a damaged capture as a clean one.
+//
+// A classic file whose last record header is complete and whose
+// payload is short lands here too, and the error says how many octets
+// were missing.
+//
+// ```novo
+// use pcapread
+//
+// fn main() [io]
+//     let r = pcapread.reader(pcapread.default_limits())
+//     match pcapread.finish(r)
+//         Ok(fed) => println("${list.len(fed.events)}")   // 1: PcapStreamEnd
+//         Err(e)  => println(e.message())
+// ```
+pub fn finish(r: PcapReader) -> Result<PcapFed, PcapError>
+    todo("pcapfile-nv.pcapread.finish")
+
+// Which format the reader is reading, or `None` before it has seen
+// the first four octets.
+//
+// ```novo
+// use pcapread
+// use pcaphdr
+//
+// fn main() [io]
+//     match pcapread.format(pcapread.reader(pcapread.default_limits()))
+//         Some(f) => println(pcaphdr.format_name(f))
+//         None    => println("not yet: no octets")
+// ```
+pub fn format(r: PcapReader) -> ?PcapFormat
+    todo("pcapfile-nv.pcapread.format")
+
+// Which way round the integers the reader is currently reading lie,
+// or `None` before the first magic number.
+//
+// It changes at a pcapng section boundary, which is the reason it is
+// a function on the reader and not a field of the file header: one
+// file may hold a big-endian section after a little-endian one.
+//
+// ```novo
+// use pcapread
+// use pcapbyte
+//
+// fn main() [io]
+//     match pcapread.order(pcapread.reader(pcapread.default_limits()))
+//         Some(o) => println(pcapbyte.order_name(o))
+//         None    => println("not yet: no magic")
+// ```
+pub fn order(r: PcapReader) -> ?PcapByteOrder
+    todo("pcapfile-nv.pcapread.order")
+
+// How many octets this reader has consumed since it was made.
+//
+// The same counter every `PcapError`'s offset is measured in, so a
+// caller can seek to a fault in the file it opened without keeping a
+// count of its own.
+//
+// ```novo
+// use pcapread
+//
+// fn main() [io]
+//     println("${pcapread.offset(pcapread.reader(pcapread.default_limits()))}")
+// ```
+pub fn offset(r: PcapReader) -> Int
+    todo("pcapfile-nv.pcapread.offset")
+
+// How many octets the reader is holding onto.
+//
+// Bounded by the limits, and small: a partial header, or the body of
+// a block being decoded whole.  Never a payload.  A supervisor that
+// wants to notice a peer sitting on half a block forever watches
+// this.
+//
+// ```novo
+// use pcapread
+//
+// fn main() [io]
+//     println("${pcapread.pending_len(pcapread.reader(pcapread.default_limits()))}")
+// ```
+pub fn pending_len(r: PcapReader) -> Int
+    todo("pcapfile-nv.pcapread.pending_len")
+
+// How many more octets the reader needs before it can produce
+// anything, or `None` when it cannot say.
+//
+// It can say when it is in the middle of something whose length it
+// has already read: a block whose total length it has, a record whose
+// captured length it has.  It cannot say while it is reading a
+// header, because the length is in the part that has not arrived.
+//
+// A caller sizing its next read uses it and avoids the two bad
+// extremes: one octet at a time, and a buffer larger than the file.
+//
+// ```novo
+// use pcapread
+//
+// fn main() [io]
+//     match pcapread.needs(pcapread.reader(pcapread.default_limits()))
+//         Some(n) => println("${n}")
+//         None    => println("read what you like")
+// ```
+pub fn needs(r: PcapReader) -> ?Int
+    todo("pcapfile-nv.pcapread.needs")
+
+// Whether a packet or a custom block is part-way through: a
+// `PcapPacketStart` has been produced and its `PcapBodyDone` has not.
+//
+// A caller that stops between packets has stopped at a place it can
+// resume from, and one that stops in the middle of a payload has
+// not.  A tool splitting a capture into files asks this.
+//
+// ```novo
+// use pcapread
+//
+// fn main() [io]
+//     println("${pcapread.body_open(pcapread.reader(pcapread.default_limits()))}")
+// ```
+pub fn body_open(r: PcapReader) -> Bool
+    todo("pcapfile-nv.pcapread.body_open")
+
+// The interfaces of the section the reader is in, in identifier
+// order.
+//
+// Empty for a classic pcap file, which has one interface it never
+// describes: `pcapread.link_type` is what answers for both formats.
+// Emptied at every Section Header Block, because interface
+// identifiers are per-section.
+//
+// ```novo
+// use pcapread
+//
+// fn main() [io]
+//     println("${list.len(pcapread.interfaces(pcapread.reader(pcapread.default_limits())))}")
+// ```
+pub fn interfaces(r: PcapReader) -> [PcapngInterface]
+    todo("pcapfile-nv.pcapread.interfaces")
+
+// The interface a packet's `interface_id` names, or `None` when the
+// current section never described it.
+//
+// `None` for a classic file, which describes no interfaces.
+//
+// ```novo
+// use pcapread
+//
+// fn main() [io]
+//     match pcapread.interface_of(pcapread.reader(pcapread.default_limits()), 0)
+//         Some(i) => println("${i.snap_length}")
+//         None    => println("no such interface in this section")
+// ```
+pub fn interface_of(r: PcapReader, interface_id: Int) -> ?PcapngInterface
+    todo("pcapfile-nv.pcapread.interface_of")
+
+// What the captured octets of a packet on this interface are, or
+// `None` before the reader knows.
+//
+// The one call a program hands to packet-nv, and the reason it is on
+// the reader rather than on the packet: a classic file states the
+// link type once in its file header and a pcapng file states it per
+// interface, and a caller should not have to know which kind of file
+// it is holding to find out what a packet is.
+//
+// ```novo
+// use pcapread
+// use pcaplink
+//
+// fn main() [io]
+//     match pcapread.link_type(pcapread.reader(pcapread.default_limits()), 0)
+//         Some(l) => println(pcaplink.link_name(l))
+//         None    => println("not yet: no header and no interface")
+// ```
+pub fn link_type(r: PcapReader, interface_id: Int) -> ?PcapLinkType
+    todo("pcapfile-nv.pcapread.link_type")
+
+// How big one tick of a packet's timestamp is on this interface, or
+// `None` before the reader knows.
+//
+// From the magic number for a classic file and from the interface's
+// `if_tsresol` for a pcapng one, which is again a difference a caller
+// should not have to ask about.  It is what `pcapts.to_unix` takes.
+//
+// ```novo
+// use pcapread
+// use pcapts
+//
+// fn main() [io]
+//     match pcapread.resolution(pcapread.reader(pcapread.default_limits()), 0)
+//         Some(r) => println("${pcapts.ticks_per_second(r)}")
+//         None    => println("not yet")
+// ```
+pub fn resolution(r: PcapReader, interface_id: Int) -> ?PcapResolution
+    todo("pcapfile-nv.pcapread.resolution")
+
+// How many seconds an interface adds to every one of its timestamps,
+// from `if_tsoffset`.
+//
+// Zero for a classic file and for a pcapng interface that did not set
+// the option, which is what makes it safe to pass straight into
+// `pcapts.to_unix` without asking whether the interface exists.
+//
+// ```novo
+// use pcapread
+//
+// fn main() [io]
+//     println("${pcapread.time_offset(pcapread.reader(pcapread.default_limits()), 0)}")
+// ```
+pub fn time_offset(r: PcapReader, interface_id: Int) -> Int
+    todo("pcapfile-nv.pcapread.time_offset")
+
+// The snapshot length in force for an interface, or `None` before the
+// reader knows.
+//
+// A reader deriving a Simple Packet Block's captured length needs it,
+// and so does a program deciding whether a packet that looks complete
+// might have been cut.
+//
+// ```novo
+// use pcapread
+//
+// fn main() [io]
+//     match pcapread.snap_length(pcapread.reader(pcapread.default_limits()), 0)
+//         Some(n) => println("${n}")
+//         None    => println("not yet")
+// ```
+pub fn snap_length(r: PcapReader, interface_id: Int) -> ?Int
+    todo("pcapfile-nv.pcapread.snap_length")

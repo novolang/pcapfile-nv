@@ -1,0 +1,157 @@
+// tests/pcapcover_tests.nv — the rest of the public surface, one case
+// each, so that no public function ships without a written
+// expectation of what it answers.
+//
+// They COMPILE today and they FAIL at run with `not implemented`.
+//
+// The four suites beside this one assert the DESIGN — the two facts
+// in a magic number, the resolution that travels separately, the
+// option code with four meanings, the length a caller cannot state
+// wrongly.  This one is the reads every one of those is built on.
+
+use std.test
+use pcapbyte
+use pcaperror
+
+// 12 34 56 78 90 AB CD EF, which reads as a different number in each
+// direction at every width — so a read that ignored its order
+// argument would be caught by any one of these.
+fn eight_octets() -> [u8]
+    [0x12 as u8, 0x34 as u8, 0x56 as u8, 0x78 as u8,
+     0x90 as u8, 0xAB as u8, 0xCD as u8, 0xEF as u8]
+
+// Eight octets of 0xFF: the unknown section length as it lies in a
+// Section Header Block, and the largest value every 64-bit field in
+// either format can hold.
+fn all_ones() -> [u8]
+    [0xFF as u8, 0xFF as u8, 0xFF as u8, 0xFF as u8,
+     0xFF as u8, 0xFF as u8, 0xFF as u8, 0xFF as u8]
+
+@test
+fn test_a_read_answers_the_order_it_was_given_and_not_the_machines() [io]
+    test.case("two octets, both ways")
+    match pcapbyte.read_u16(eight_octets(), 0, PcapBigEndian)
+        Some(v) => test.assert(v == 4660)
+        None    => test.fail("eight octets hold a u16 at offset 0")
+    match pcapbyte.read_u16(eight_octets(), 0, PcapLittleEndian)
+        Some(v) => test.assert(v == 13330)
+        None    => test.fail("eight octets hold a u16 at offset 0")
+
+    test.case("four octets, both ways")
+    match pcapbyte.read_u32(eight_octets(), 0, PcapBigEndian)
+        Some(v) => test.assert(v == 305419896)
+        None    => test.fail("eight octets hold a u32 at offset 0")
+    match pcapbyte.read_u32(eight_octets(), 0, PcapLittleEndian)
+        Some(v) => test.assert(v == 2018915346)
+        None    => test.fail("eight octets hold a u32 at offset 0")
+
+    test.case("and a read past the end is None, not a zero")
+    // None is how a caller walking a block's options tells "the
+    // option header is there" from "the block ended".
+    match pcapbyte.read_u32(eight_octets(), 6, PcapBigEndian)
+        Some(_) => test.fail("only two octets remain at offset 6")
+        None    => test.assert(true)
+
+@test
+fn test_a_u32_is_never_negative_and_an_i32_may_be() [io]
+    // Every length, every timestamp half and every block type in both
+    // formats is unsigned.  A reader that sign-extended one answers a
+    // negative capture length for any file over two gibibytes.
+    test.case("0xFFFFFFFF unsigned is 4294967295")
+    match pcapbyte.read_u32([0xFF as u8, 0xFF as u8, 0xFF as u8, 0xFF as u8],
+                            0, PcapLittleEndian)
+        Some(v) => test.assert(v == 4294967295)
+        None    => test.fail("four octets are a u32")
+
+    test.case("and the same four octets signed are -1")
+    // The two signed fields are the classic header's thiszone and the
+    // if_tzone option.  A reader that read thiszone unsigned turns a
+    // capture made west of Greenwich into one made in 2106.
+    match pcapbyte.read_i32([0xFF as u8, 0xFF as u8, 0xFF as u8, 0xFF as u8],
+                            0, PcapBigEndian)
+        Some(v) => test.assert(v == 0 - 1)
+        None    => test.fail("four octets are an i32")
+
+@test
+fn test_a_64_bit_read_says_None_rather_than_answering_a_wrong_number() [io]
+    test.case("a small value reads back")
+    match pcapbyte.read_u64(eight_octets(), 0, PcapBigEndian)
+        Some(v) => test.assert(v == 1311768467294899695)
+        None    => test.fail("these eight octets fit a signed Int")
+
+    test.case("and a value above what an Int holds is None, not a negative")
+    // 0xFFFFFFFFFFFFFFFF is the unknown section length, and a reader
+    // that answered -1 for it would have answered a number.
+    match pcapbyte.read_u64(all_ones(), 0, PcapLittleEndian)
+        Some(_) => test.fail("that value does not fit a signed Int")
+        None    => test.assert(true)
+
+    test.case("read signed, the same octets are the -1 the format means")
+    match pcapbyte.read_i64(all_ones(), 0, PcapLittleEndian)
+        Some(v) => test.assert(v == 0 - 1)
+        None    => test.fail("eight octets are an i64")
+
+    test.case("and a short list is None at every width")
+    match pcapbyte.read_i64(list.zeros(7), 0, PcapBigEndian)
+        Some(_) => test.fail("seven octets are not an i64")
+        None    => test.assert(true)
+
+@test
+fn test_every_refusal_carries_the_offset_to_cut_at() [io]
+    // A fault in a capture file is almost always local, the rest of
+    // the file is usually fine, and the person holding it wants to
+    // know where to cut.
+    test.case("the offset comes back without a match")
+    test.assert(pcaperror.at(PcapTruncated(2048, 16, 3)) == 2048)
+    test.assert(pcaperror.at(PcapBadMagic(0, 305419896)) == 0)
+    test.assert(pcaperror.at(PcapLengthMismatch(1024, 64, 68)) == 1024)
+
+    test.case("and the code is stable and carries nothing the file said")
+    // Putting a message in a metric label would put an
+    // attacker-chosen number into a time series database.
+    test.assert(pcaperror.code(PcapNoInterface(28)) == "no_interface")
+    test.assert(pcaperror.code(PcapTruncated(1, 2, 3)) == "truncated")
+
+    test.case("running out of octets is the only refusal that means keep going")
+    test.assert(pcaperror.is_truncation(PcapTruncated(2048, 16, 3)))
+    test.assert(not pcaperror.is_truncation(PcapLengthMismatch(1024, 64, 68)))
+    test.assert(not pcaperror.is_truncation(PcapBadBlockLength(0, 7)))
+
+    test.case("and one refusal is the calling program's own fault")
+    test.assert(pcaperror.is_caller_fault(PcapUnwritable(0, "snapshot length")))
+    test.assert(not pcaperror.is_caller_fault(PcapBadMagic(0, 0)))
+    test.assert(not pcaperror.is_caller_fault(PcapCapturedExceedsOriginal(64, 100, 60)))
+
+@test
+fn test_the_refusals_that_only_a_pcapng_file_can_produce() [io]
+    test.case("the two length copies disagreeing is its own reason")
+    // A file whose two walks disagree is a file where one of them is
+    // reading a different set of blocks.
+    test.assert(pcaperror.code(PcapLengthMismatch(1024, 64, 68)) == "length_mismatch")
+
+    test.case("and so is a block length that is unwalkable")
+    test.assert(pcaperror.code(PcapBadBlockLength(0, 7)) == "bad_block_length")
+
+    test.case("an interface a section never described")
+    test.assert(pcaperror.code(PcapNoSuchInterface(96, 3)) == "no_such_interface")
+
+    test.case("an option whose length runs past its block")
+    test.assert(pcaperror.code(PcapBadOption(120, 2, 65535)) == "bad_option")
+
+    test.case("a name record that does not match its own type")
+    test.assert(pcaperror.code(PcapBadNameRecord(200, 1, 6)) == "bad_name_record")
+
+    test.case("and the limits the caller set, each with its own reason")
+    test.assert(pcaperror.code(PcapBlockTooLarge(0, 1, 0)) == "block_too_large")
+    test.assert(pcaperror.code(PcapTooManyOptions(0, 32)) == "too_many_options")
+    test.assert(pcaperror.code(PcapCapturedTooLarge(0, 99999, 2048))
+                == "captured_too_large")
+    test.assert(pcaperror.code(PcapBadResolution(0, 30)) == "bad_resolution")
+    test.assert(pcaperror.code(PcapBadVersion(0, 3, 0)) == "bad_version")
+    test.assert(pcaperror.code(PcapBadByteOrderMagic(0, 0)) == "bad_byte_order_magic")
+
+@test
+fn test_a_message_is_for_a_log_and_says_where() [io]
+    test.case("every reason has one")
+    test.assert(str.len(PcapBadMagic(0, 305419896).message()) > 0)
+    test.assert(str.len(PcapTruncated(2048, 16, 3).message()) > 0)

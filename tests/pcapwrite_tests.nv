@@ -1,0 +1,229 @@
+// tests/pcapwrite_tests.nv — the writer: the length a caller cannot
+// state wrongly, and the trailing length copy nothing may leave out.
+//
+// They COMPILE today and they FAIL at run with `not implemented`.
+// The sizes are the specifications' own: 24 octets of classic file
+// header, 16 of classic record header, 12 of pcapng block framing.
+
+use std.test
+use pcapbyte
+use pcaperror
+use pcaphdr
+use pcapngblock
+use pcapngopt
+use pcapts
+use pcapwrite
+
+fn an_ethernet_header() -> PcapFileHeader
+    pcaphdr.file_header(PcapMagicMicrosecondSwapped, 262144, PcapLinkEthernet)
+
+fn a_60_octet_frame() -> PcapOutPacket
+    pcapwrite.whole_packet(0, pcapts.timestamp(1700000000500000), list.zeros(60))
+
+@test
+fn test_the_captured_length_is_the_payloads_length_and_cannot_disagree() [io]
+    // The commonest way a hand-written capture writer produces a file
+    // no tool will read: the length field and the octets disagree,
+    // every reader walks to the wrong place, and the next block is
+    // nonsense.  The field that can be wrong does not exist here.
+    test.case("a whole packet states its length once")
+    let whole = a_60_octet_frame()
+    test.assert(whole.original_length == 60)
+    test.assert(list.len(whole.payload) == 60)
+
+    test.case("a truncated one states the wire length separately")
+    let cut = pcapwrite.out_packet(0, pcapts.timestamp(0), 1514, list.zeros(96))
+    test.assert(cut.original_length == 1514)
+    test.assert(list.len(cut.payload) == 96)
+
+    test.case("and an original length below the captured one is refused")
+    let impossible = pcapwrite.out_packet(0, pcapts.timestamp(0), 10, list.zeros(96))
+    match pcapwrite.classic_record(impossible, PcapLittleEndian, pcapts.micros())
+        Ok(_)  => test.fail("more octets cannot be saved than were on the wire")
+        Err(e) => test.assert(pcaperror.is_caller_fault(e))
+
+@test
+fn test_a_classic_file_is_24_octets_of_header_and_16_per_record() [io]
+    test.case("the header")
+    match pcapwrite.classic_header(an_ethernet_header())
+        Ok(b)  => test.assert(list.len(b) == 24)
+        Err(_) => test.fail("a classic file header is always 24 octets")
+
+    test.case("a record, which is NOT padded — that is a pcapng rule")
+    // Padding a classic record produces a file every reader walks off
+    // the end of.
+    match pcapwrite.classic_record(a_60_octet_frame(), PcapLittleEndian,
+                                   pcapts.micros())
+        Ok(b)  => test.assert(list.len(b) == 76)
+        Err(_) => test.fail("16 octets of header and 60 of frame")
+
+    test.case("and a whole file with no packets is just the header")
+    match pcapwrite.classic_file(an_ethernet_header(), [])
+        Ok(b)  => test.assert(list.len(b) == 24)
+        Err(_) => test.fail("an empty capture is a legal capture")
+
+    test.case("a file whose magic cannot express the resolution is refused")
+    // There is no fifth classic magic number, so a caller holding a
+    // capture at 2^-16 seconds has to choose what to lose.
+    match pcaphdr.magic_for(PcapLittleEndian, PcapBinaryResolution(16))
+        Ok(_)  => test.fail("the classic format has four magic numbers")
+        Err(e) => test.assert(pcaperror.code(e) == "unwritable")
+
+@test
+fn test_every_pcapng_block_carries_its_length_twice() [io]
+    // Leaving the trailing copy out produces a file that reads
+    // forwards and is unwalkable backwards, which nothing notices
+    // until somebody opens the last thousand packets of a large
+    // capture.
+    test.case("framing is four of type, four of length, the body, and four again")
+    match pcapwrite.block(PcapngSimplePacket, list.zeros(8), PcapLittleEndian)
+        Ok(b)  => test.assert(list.len(b) == 20)
+        Err(_) => test.fail("12 octets of framing and 8 of body")
+
+    test.case("and a body that is not a multiple of four is padded inside it")
+    match pcapwrite.block(PcapngSimplePacket, list.zeros(9), PcapBigEndian)
+        Ok(b)  => test.assert(list.len(b) == 24)
+        Err(_) => test.fail("9 octets of body pad to 12")
+
+    test.case("the padding rule is the same one the options use")
+    test.assert(list.len(pcapwrite.padding(13)) == 3)
+    test.assert(list.len(pcapwrite.padding(16)) == 0)
+
+@test
+fn test_an_empty_options_list_writes_nothing_at_all() [io]
+    // A block with no options has no options area.  A writer that
+    // emitted a bare end marker would add four octets to every packet
+    // in the file.
+    test.case("no options, no octets")
+    match pcapwrite.options([], PcapLittleEndian)
+        Ok(b)  => test.assert(list.len(b) == 0)
+        Err(_) => test.fail("an empty options list is legal")
+
+    test.case("one one-octet option is four of header, one of value, three of padding")
+    match pcapwrite.options([pcapngopt.option(9, list.zeros(1))], PcapBigEndian)
+        Ok(b)  => test.assert(list.len(b) == 12)
+        Err(_) => test.fail("8 octets of option and 4 of end marker")
+
+@test
+fn test_a_section_header_is_written_in_the_order_it_declares() [io]
+    test.case("28 octets: the framing, the magic, the versions and the length")
+    let s = pcapngblock.section(PcapLittleEndian, 1, 0, None, [], 0)
+    match pcapwrite.section_header(s)
+        Ok(b)  => test.assert(list.len(b) == 28)
+        Err(_) => test.fail("a section header with no options is 28 octets")
+
+@test
+fn test_an_interface_omits_an_option_whose_value_is_the_default() [io]
+    // An interface at microsecond resolution writes no if_tsresol,
+    // which is what every other writer does and what keeps a round
+    // trip through this package octet-for-octet stable.
+    test.case("a default interface is 20 octets and carries no options")
+    let i = pcapngblock.interface(0, PcapLinkEthernet, 262144, [])
+    match pcapwrite.interface_description(i, PcapLittleEndian)
+        Ok(b)  => test.assert(list.len(b) == 20)
+        Err(_) => test.fail("12 of framing, 2 of link type, 2 reserved, 4 of snaplen")
+
+@test
+fn test_a_packet_block_pads_its_payload_and_counts_the_padding_in_the_block() [io]
+    // The pcapng rule that most often goes wrong by hand: the padding
+    // is NOT in the captured length and IS in the block total length.
+    test.case("60 octets of frame need no padding")
+    match pcapwrite.enhanced_packet(a_60_octet_frame(), [], PcapLittleEndian,
+                                    pcapts.micros())
+        Ok(b)  => test.assert(list.len(b) == 92)
+        Err(_) => test.fail("20 octets of body fields, 60 of frame, 12 of framing")
+
+    test.case("62 octets need two, and the block grows by four")
+    let odd = pcapwrite.whole_packet(0, pcapts.timestamp(0), list.zeros(62))
+    match pcapwrite.enhanced_packet(odd, [], PcapLittleEndian, pcapts.micros())
+        Ok(b)  => test.assert(list.len(b) == 96)
+        Err(_) => test.fail("62 octets pad to 64")
+
+@test
+fn test_a_simple_packet_block_cannot_record_a_truncation() [io]
+    // A reader derives a Simple Packet Block's captured length from
+    // the block's total length, which includes the padding.  A
+    // truncated packet written as one comes back with padding octets
+    // on the end of the frame.
+    test.case("a whole packet is 76 octets")
+    match pcapwrite.simple_packet(a_60_octet_frame(), PcapLittleEndian)
+        Ok(b)  => test.assert(list.len(b) == 76)
+        Err(_) => test.fail("12 of framing, 4 of original length, 60 of frame")
+
+    test.case("and a truncated one is refused, naming the caller")
+    let cut = pcapwrite.out_packet(0, pcapts.timestamp(0), 1514, list.zeros(96))
+    match pcapwrite.simple_packet(cut, PcapLittleEndian)
+        Ok(_)  => test.fail("a Simple Packet Block has nowhere to say it was cut")
+        Err(e) => test.assert(pcaperror.is_caller_fault(e))
+
+@test
+fn test_the_remaining_blocks_write_their_own_shapes() [io]
+    test.case("a name resolution block with no records is the end marker alone")
+    match pcapwrite.name_resolution(pcapngblock.name_resolution([], []),
+                                    PcapLittleEndian)
+        Ok(b)  => test.assert(list.len(b) == 16)
+        Err(_) => test.fail("12 of framing and 4 of nrb_record_end")
+
+    test.case("a statistics block is the interface and the two timestamp halves")
+    match pcapwrite.interface_statistics(
+              pcapngblock.statistics(0, pcapts.timestamp(0), []), PcapLittleEndian)
+        Ok(b)  => test.assert(list.len(b) == 24)
+        Err(_) => test.fail("12 of framing and 12 of body")
+
+    test.case("a custom block is the enterprise number and then the data")
+    match pcapwrite.custom_block(pcapngblock.custom(32473, true, 0, 0),
+                                 list.zeros(8), PcapLittleEndian)
+        Ok(b)  => test.assert(list.len(b) == 24)
+        Err(_) => test.fail("12 of framing, 4 of enterprise number, 8 of data")
+
+@test
+fn test_a_whole_pcapng_file_refuses_a_packet_with_no_interface() [io]
+    // The mistake that produces a pcapng file whose packets no reader
+    // can decode, and the only one the convenience can catch that the
+    // per-block functions cannot.
+    test.case("a section and one interface, with no packets")
+    let s = pcapngblock.section(PcapLittleEndian, 1, 0, None, [], 0)
+    let i = pcapngblock.interface(0, PcapLinkEthernet, 262144, [])
+    match pcapwrite.ng_file(s, [i], [])
+        Ok(b)  => test.assert(list.len(b) == 48)
+        Err(_) => test.fail("28 octets of section header and 20 of interface")
+
+    test.case("and a packet naming an interface nobody described is refused")
+    let stray = pcapwrite.whole_packet(3, pcapts.timestamp(0), list.zeros(60))
+    match pcapwrite.ng_file(s, [i], [stray])
+        Ok(_)  => test.fail("interface 3 was never described")
+        Err(e) => test.assert(pcaperror.code(e) == "no_such_interface")
+
+@test
+fn test_every_integer_written_takes_the_order_as_an_argument() [io]
+    // There is no host order in this package.  A writer that used its
+    // own machine's produces a file whose magic says one thing and
+    // whose fields say another.
+    test.case("the two orders are two values, and each is the other's opposite")
+    test.assert(pcapbyte.order_name(pcapbyte.opposite(PcapBigEndian))
+                == "little-endian")
+    test.assert(pcapbyte.order_name(pcapbyte.opposite(PcapLittleEndian))
+                == "big-endian")
+
+    test.case("a 16-bit field is two octets and a 32-bit one is four")
+    match pcapbyte.write_u16(4660, PcapBigEndian)
+        Ok(b)  => test.assert(list.len(b) == 2)
+        Err(_) => test.fail("4660 fits sixteen bits")
+    match pcapbyte.write_u32(4294967295, PcapLittleEndian)
+        Ok(b)  => test.assert(list.len(b) == 4)
+        Err(_) => test.fail("4294967295 is the largest a u32 holds")
+
+    test.case("a value the field cannot hold is refused, never masked")
+    // A truncated length field is a corrupt file that no reader will
+    // report.
+    match pcapbyte.write_u16(65536, PcapBigEndian)
+        Ok(_)  => test.fail("65536 does not fit sixteen bits")
+        Err(e) => test.assert(pcaperror.is_caller_fault(e))
+
+    test.case("and the signed writes exist for the two signed fields")
+    match pcapbyte.write_i32(0 - 3600, PcapBigEndian)
+        Ok(b)  => test.assert(list.len(b) == 4)
+        Err(_) => test.fail("thiszone is a signed field")
+    match pcapbyte.write_i64(0 - 1, PcapLittleEndian)
+        Ok(b)  => test.assert(list.len(b) == 8)
+        Err(_) => test.fail("an unknown section length is -1")

@@ -1,0 +1,173 @@
+// tests/pcapread_tests.nv — the reader: what a prefix is, what a
+// truncation is, and where a payload lives.
+//
+// They COMPILE today and they FAIL at run with `not implemented`.
+// The fixture is the smallest complete classic capture there is: the
+// 24-octet file header of a little-endian microsecond Ethernet file.
+
+use std.test
+use pcapbyte
+use pcaperror
+use pcaphdr
+use pcaplink
+use pcapread
+use pcapts
+
+// The 24 octets a classic little-endian microsecond Ethernet capture
+// begins with: D4 C3 B2 A1, version 2.4, no zone, no sigfigs, a
+// snapshot length of 262144, link type 1.
+fn a_classic_file_header() -> [u8]
+    [0xD4 as u8, 0xC3 as u8, 0xB2 as u8, 0xA1 as u8,
+     0x02 as u8, 0x00 as u8, 0x04 as u8, 0x00 as u8,
+     0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+     0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8,
+     0x00 as u8, 0x00 as u8, 0x04 as u8, 0x00 as u8,
+     0x01 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8]
+
+fn a_fresh_reader() -> PcapReader
+    pcapread.reader(pcapread.default_limits())
+
+@test
+fn test_a_fresh_reader_holds_nothing_and_knows_nothing() [io]
+    test.case("no octets, so no format and no byte order")
+    let r = a_fresh_reader()
+    test.assert(pcapread.pending_len(r) == 0)
+    test.assert(pcapread.offset(r) == 0)
+    test.assert(not pcapread.body_open(r))
+    match pcapread.format(r)
+        Some(_) => test.fail("nothing has been fed yet")
+        None    => test.assert(true)
+    match pcapread.order(r)
+        Some(_) => test.fail("the order comes from a magic nobody has sent")
+        None    => test.assert(true)
+
+    test.case("and no interfaces, in either format")
+    test.assert(list.len(pcapread.interfaces(r)) == 0)
+    match pcapread.interface_of(r, 0)
+        Some(_) => test.fail("no section has described an interface")
+        None    => test.assert(true)
+
+@test
+fn test_a_prefix_is_not_an_event_and_not_an_error() [io]
+    // The distinction the package is built on.  A reader that has
+    // been given half a header has been given half a header, and on a
+    // file still being written that is the ordinary case.
+    test.case("four octets of a 24-octet header")
+    match pcapread.feed(a_fresh_reader(), pcaphdr.magic_bytes(PcapMagicMicrosecondSwapped))
+        Err(_)  => test.fail("a prefix of a file header is not malformed")
+        Ok(fed) => test.assert(list.len(fed.events) == 0)
+
+    test.case("and an empty chunk is a prefix of everything")
+    match pcapread.feed(a_fresh_reader(), [])
+        Err(_)  => test.fail("feeding nothing is not a fault")
+        Ok(fed) => test.assert(list.len(fed.events) == 0)
+
+@test
+fn test_a_whole_file_header_is_one_event_and_sets_the_readers_state() [io]
+    test.case("the header arrives, and the reader now knows the format")
+    match pcapread.feed(a_fresh_reader(), a_classic_file_header())
+        Err(_)  => test.fail("this is a well-formed classic file header")
+        Ok(fed) =>
+            test.assert(list.len(fed.events) == 1)
+            test.assert(fed.consumed == 24)
+            test.assert(pcapread.offset(fed.reader) == 24)
+
+    test.case("the format, the order and the resolution all follow from it")
+    match pcapread.feed(a_fresh_reader(), a_classic_file_header())
+        Err(_)  => test.fail("this is a well-formed classic file header")
+        Ok(fed) =>
+            match pcapread.format(fed.reader)
+                Some(f) => test.assert(pcaphdr.format_name(f) == "pcap")
+                None    => test.fail("the magic said which format this is")
+            match pcapread.order(fed.reader)
+                Some(o) => test.assert(pcapbyte.order_name(o) == "little-endian")
+                None    => test.fail("D4 C3 B2 A1 is a little-endian file")
+
+@test
+fn test_the_link_type_is_answered_for_both_formats_by_the_same_call() [io]
+    // A classic file states it once in its header and a pcapng file
+    // states it per interface.  A caller should not have to know
+    // which kind of file it is holding to find out what a packet is.
+    test.case("a classic file answers from its header, with no interface table")
+    match pcapread.feed(a_fresh_reader(), a_classic_file_header())
+        Err(_)  => test.fail("this is a well-formed classic file header")
+        Ok(fed) =>
+            match pcapread.link_type(fed.reader, 0)
+                Some(l) => test.assert(pcaplink.link_code(l) == 1)
+                None    => test.fail("the header named LINKTYPE_ETHERNET")
+            match pcapread.resolution(fed.reader, 0)
+                Some(res) => test.assert(pcapts.ticks_per_second(res) == 1000000)
+                None      => test.fail("the magic said microseconds")
+            match pcapread.snap_length(fed.reader, 0)
+                Some(n) => test.assert(n == 262144)
+                None    => test.fail("the header stated a snapshot length")
+
+    test.case("and the offset is zero, so it can be passed straight on")
+    // A classic file has no if_tsoffset, and neither does a pcapng
+    // interface that did not set one, which is what makes this safe
+    // to hand to pcapts.to_unix without asking first.
+    match pcapread.feed(a_fresh_reader(), a_classic_file_header())
+        Err(_)  => test.fail("this is a well-formed classic file header")
+        Ok(fed) => test.assert(pcapread.time_offset(fed.reader, 0) == 0)
+
+@test
+fn test_a_front_that_is_not_a_capture_is_refused_at_the_first_call() [io]
+    test.case("a gzipped capture is not a capture")
+    let gz = [0x1F as u8, 0x8B as u8, 0x08 as u8, 0x00 as u8,
+              0x00 as u8, 0x00 as u8, 0x00 as u8, 0x00 as u8]
+    match pcapread.feed(a_fresh_reader(), gz)
+        Ok(_)  => test.fail("this package does not decompress anything")
+        Err(e) =>
+            test.assert(pcaperror.code(e) == "bad_magic")
+            test.assert(pcaperror.at(e) == 0)
+
+@test
+fn test_finish_is_what_tells_a_clean_end_from_a_damaged_one() [io]
+    // A file that ends between blocks is a complete capture; one that
+    // ends inside a block is what a killed tcpdump and a full disk
+    // both leave behind.  A reader that was never told cannot tell
+    // them apart.
+    test.case("an empty stream ends cleanly")
+    match pcapread.finish(a_fresh_reader())
+        Err(_)  => test.fail("a stream with nothing in it ended between blocks")
+        Ok(fed) => test.assert(list.len(fed.events) == 1)
+
+    test.case("and a stream that stopped inside a header is a truncation")
+    match pcapread.feed(a_fresh_reader(), pcaphdr.magic_bytes(PcapMagicMicrosecondSwapped))
+        Err(_)  => test.fail("four octets are a prefix, not a fault")
+        Ok(fed) =>
+            match pcapread.finish(fed.reader)
+                Ok(_)  => test.fail("four octets are not a whole file header")
+                Err(e) =>
+                    test.assert(pcaperror.is_truncation(e))
+                    test.assert(not pcaperror.is_caller_fault(e))
+
+@test
+fn test_the_limits_are_the_callers_and_not_this_packages() [io]
+    // A length field in a capture file is a number from somewhere
+    // else, and an unbounded one is a denial of service that costs an
+    // attacker one corrupt octet.
+    test.case("the defaults are a workstation's")
+    let d = pcapread.default_limits()
+    test.assert(d.max_captured == 262144)
+    test.assert(d.max_interfaces == 256)
+    test.assert(d.max_options == 1024)
+    test.assert(d.max_block == 16777216)
+
+    test.case("and the embedded ones are three orders of magnitude smaller")
+    let e = pcapread.embedded_limits()
+    test.assert(e.max_captured == 2048)
+    test.assert(e.max_block == 8192)
+    test.assert(e.max_options == 32)
+    test.assert(e.max_interfaces == 4)
+
+@test
+fn test_a_reader_says_how_much_it_wants_when_it_can() [io]
+    test.case("it cannot say while it is reading a header")
+    // The length is in the part that has not arrived.
+    match pcapread.needs(a_fresh_reader())
+        Some(_) => test.fail("nothing has said how long anything is yet")
+        None    => test.assert(true)
+
+    test.case("and it is not part-way through a body either")
+    test.assert(not pcapread.body_open(a_fresh_reader()))

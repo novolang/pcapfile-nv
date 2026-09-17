@@ -1,0 +1,63 @@
+[package]
+name        = "pcapfile-nv"
+version     = "0.0.1"
+description = "Packet capture files, read and written without a file system: classic pcap and pcapng through one feed-and-drain reader that hands back the captured octets as a span into the caller's own chunk, with the byte order taken from the magic, the link type named, the timestamp resolution exact, and a builder that turns a header and packets back into bytes."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`.  A capture file is the thing every reference library opens
+# for you, and opening it is exactly what this package will not do:
+# the bytes arrive from a file the caller opened, from a pipe, from a
+# `tcpdump -w -` on the far end of a socket, or from a decompressor,
+# and none of those is this package's business.  So nothing here
+# opens, seeks, closes or waits, and there is no clock either — a
+# capture file records when a packet was seen, and a package that
+# could read `now` would invite a writer to stamp one, which is how a
+# capture stops being a record of what happened.  Every instant in
+# this package arrives as an argument.
+#
+# The one thing a `core` byte reader normally gives up is the payload,
+# because holding it means owning it.  `PcapSpan` is how it is not
+# given up: a payload event names an offset and a length inside the
+# chunk the caller just fed, so the captured octets are never copied
+# and packet-nv parses them where they lie.
+layer       = "core"
+
+category    = "networking"
+
+tags        = ["pcap", "pcapng", "capture", "libpcap", "linktype", "tcpdump", "wireshark", "sans-io", "state-machine", "networking"]
+repository  = "https://github.com/novolang/pcapfile-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.9.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Packet capture files, without a file system"
+
+[dependencies]
+# None, and each of the three candidates was refused for its own
+# reason.
+#
+# ipaddr-nv would hold a Name Resolution Block's address as an `Ipv4`
+# or an `Ipv6` rather than as the four or sixteen octets the block
+# wrote.  Its two address types are `@value`, a record carries a list
+# of names beside the address and so cannot be one, and a boxed struct
+# may not hold an unboxed one (E2015).  The record carries the octets;
+# a caller that wants them parsed hands them to ipaddr-nv itself.
+#
+# calendar-nv converts a Unix instant to a civil date.  Nothing in a
+# capture file is a civil date: both formats count from the Unix epoch
+# and this package answers seconds and nanoseconds, which is where its
+# job ends.
+#
+# packet-nv parses what a capture yields.  The dependency runs the
+# other way, and a capture reader that took it would make every
+# consumer of a file format take a protocol decoder.

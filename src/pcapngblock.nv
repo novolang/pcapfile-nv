@@ -1,0 +1,584 @@
+// pcapngblock.nv — the pcapng block, and the three blocks that carry
+// something other than a packet.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// EVERY BLOCK HAS THE SAME FRAME
+//
+// A pcapng block is a 32-bit type, a 32-bit total length, a body,
+// padding to a 32-bit boundary, and the SAME total length again at
+// the end.  The total length counts all of that, framing included,
+// and is always a multiple of four.
+//
+// Two things follow, and they are the reason the format exists.  A
+// reader that meets a block type it has never heard of steps over it
+// by its total length and carries on, so a file written by a newer
+// tool is still readable by an older one.  And a reader that starts
+// at the END of a file reads the trailing length, steps back by it,
+// and walks the file backwards — which is how a tool shows the last
+// hundred packets of a forty-gigabyte capture without reading the
+// other thirty-nine.
+//
+// That second copy is the one thing about pcapng most hand-written
+// readers get wrong, and getting it wrong is invisible while reading
+// forwards.  `PcapLengthMismatch` is what this package answers when
+// the two disagree, because a file whose two walks disagree is a file
+// where one of them is reading a different set of blocks.
+//
+// A SECTION OWNS ITS BYTE ORDER AND ITS INTERFACES
+//
+// A pcapng file is a sequence of SECTIONS, each beginning with a
+// Section Header Block, and appending one capture to another is
+// literally concatenating the files.  So a single file may hold a
+// big-endian section after a little-endian one, and the interface
+// numbering restarts at zero in each: an Enhanced Packet Block naming
+// interface 1 means the second Interface Description Block OF ITS OWN
+// SECTION.  A reader that kept one interface table across a section
+// boundary reports the wrong link type for every packet after it, and
+// the packets still decode — into whatever the wrong link type says
+// they are.
+
+// What kind of block this is.
+//
+// ```novo
+// use pcapngblock
+//
+// fn main() [io]
+//     println("${pcapngblock.block_code(PcapngEnhancedPacket)}")   // 6
+// ```
+pub enum PcapngBlockType
+    // 0x0A0D0D0A.  Begins a section, and fixes that section's byte
+    // order, version and interface numbering.  The type is a
+    // palindrome so that it reads the same whichever way round the
+    // section turns out to be.
+    PcapngSectionHeader
+    // 0x00000001.  Describes one interface: its link type, its
+    // snapshot length, and its options.  Its position among the
+    // Interface Description Blocks of its section IS its identifier.
+    PcapngInterfaceDescription
+    // 0x00000006.  A packet with an interface, a 64-bit timestamp,
+    // both lengths, the octets, and options after them.  What a
+    // current writer produces.
+    PcapngEnhancedPacket
+    // 0x00000003.  A packet with an original length and the octets,
+    // and nothing else — no interface, no timestamp, no captured
+    // length.  For a writer minimising what it stores.
+    PcapngSimplePacket
+    // 0x00000004.  Addresses and the names they resolved to, so that
+    // a capture read later shows the names the capture saw rather
+    // than whatever DNS says now.
+    PcapngNameResolution
+    // 0x00000005.  How many packets an interface received and dropped
+    // over a stretch of the capture.  The block that says whether the
+    // capture is complete.
+    PcapngInterfaceStatistics
+    // 0x00000BAD when the block may be copied into a rewritten file
+    // and 0x40000BAD when it may not.  The body begins with the IANA
+    // Private Enterprise Number of whoever defined it, and nothing
+    // else about it is specified.
+    PcapngCustom(copiable: Bool)
+    // 0x00000002.  The obsolete Packet Block, superseded by the
+    // Enhanced Packet Block in 2004.  Old files hold them; this
+    // package names it so that a reader can say what it skipped.
+    PcapngObsoletePacket
+    // Any other block type, as the file wrote it.  Skipped by its
+    // total length, which is what the format is built for.
+    PcapngBlockOther(code: Int)
+
+// The framing of one block: what kind, how big, and where.
+//
+// It is what a reader hands back for a block it did not decode, and
+// what every decoded block carries alongside its own fields.
+//
+// ```novo
+// use pcapngblock
+//
+// fn main() [io]
+//     let b = pcapngblock.block(PcapngObsoletePacket, 64, 1024)
+//     println("${b.total_length} at ${b.at}")
+// ```
+pub struct PcapngBlock
+    // What kind of block.
+    kind: PcapngBlockType
+    // The Block Total Length, framing and padding included.  Always a
+    // multiple of four and never less than twelve.
+    total_length: Int
+    // Where the block's first octet lies in the stream.
+    at: Int
+
+// A section: what a Section Header Block said about everything that
+// follows it, until the next one.
+//
+// ```novo
+// use pcapngblock
+// use pcapbyte
+//
+// fn main() [io]
+//     let s = pcapngblock.section(PcapLittleEndian, 1, 0, None, [], 0)
+//     println("${s.version_major}.${s.version_minor}")     // 1.0
+// ```
+pub struct PcapngSection
+    // Which way round every integer in this section lies, taken from
+    // the Byte-Order Magic.  The next section may differ.
+    order: PcapByteOrder
+    // The major version.  1 in every file; this package refuses
+    // anything else, because a new major version may move a field.
+    version_major: Int
+    // The minor version.  0 in every file.
+    version_minor: Int
+    // How many octets follow the Section Header Block in this
+    // section, or `None` when the writer did not know.  A writer that
+    // is still writing cannot know, so `None` is the common case and
+    // a reader that treated it as zero would stop at the first
+    // packet.
+    length: ?Int
+    // The section's options: the hardware, the operating system, the
+    // program that wrote the file, and any comments.
+    options: [PcapngOption]
+    // Where the Section Header Block begins in the stream.
+    at: Int
+
+// One interface of a section: what its packets are and what their
+// timestamps mean.
+//
+// Every field but `id` and `options` comes either from an Interface
+// Description Block field or from one of its options, with the
+// specification's default when the option is absent.  The defaults
+// are applied HERE rather than left to each caller, because
+// microseconds and an offset of zero are what the specification says
+// an absent option means, and a caller that guessed differently would
+// misdate a whole capture.
+//
+// ```novo
+// use pcapngblock
+// use pcaplink
+//
+// fn main() [io]
+//     let i = pcapngblock.interface(0, PcapLinkEthernet, 262144, [])
+//     println("${i.snap_length} ${pcaplink.link_name(i.link_type)}")
+// ```
+pub struct PcapngInterface
+    // Which interface of its section this is, counted from zero in
+    // the order the Interface Description Blocks appeared.  The
+    // number an Enhanced Packet Block names.
+    id: Int
+    // What the captured octets of this interface's packets are.
+    link_type: PcapLinkType
+    // The most octets this interface saved from any one packet.  Zero
+    // means no limit, which is what the specification says and what a
+    // reader deriving a Simple Packet Block's captured length has to
+    // account for.
+    snap_length: Int
+    // How big one tick of this interface's timestamps is, from
+    // `if_tsresol`.  Microseconds when the option is absent.
+    resolution: PcapResolution
+    // The interface's name from `if_name`, or `""`.
+    name: Str
+    // The interface's description from `if_description`, or `""`.
+    description: Str
+    // The seconds added to every timestamp on this interface, from
+    // `if_tsoffset`.  Zero when the option is absent.
+    offset_seconds: Int
+    // How many octets of frame check sequence are inside the captured
+    // octets, from `if_fcslen`, or `None` when the interface did not
+    // say.  `None` is not zero: it means the capture did not state
+    // whether the four trailing octets of an Ethernet frame are the
+    // FCS or the payload.
+    fcs_length: ?Int
+    // Every option the block carried, including the ones read into
+    // the fields above.
+    options: [PcapngOption]
+
+// One record of a Name Resolution Block: an address and the names it
+// resolved to.
+//
+// ```novo
+// use pcapngblock
+//
+// fn main() [io]
+//     let r = pcapngblock.name_record(1, list.zeros(4), ["gateway"])
+//     println("${list.len(r.names)}")                 // 1
+// ```
+pub struct PcapngNameRecord
+    // 1 for an IPv4 address and 2 for an IPv6 one, as the block wrote
+    // it.  Any other value is a record type this package does not
+    // know, kept so that a rewriter can copy it through.
+    record_type: Int
+    // The address, exactly as the block wrote it: four octets for
+    // IPv4 and sixteen for IPv6, in network order.  Octets rather
+    // than a parsed address, so that this package declares no address
+    // type — a caller hands these to ipaddr-nv.
+    address: [u8]
+    // The names, in the order the record listed them.  A record may
+    // carry several: the block stores them NUL-separated and the
+    // separators are gone by the time they get here.
+    names: [Str]
+
+// What a Name Resolution Block said.
+//
+// ```novo
+// use pcapngblock
+//
+// fn main() [io]
+//     let n = pcapngblock.name_resolution([], [])
+//     println("${list.len(n.records)}")               // 0
+// ```
+pub struct PcapngNameResolution
+    // The records, in the order the block wrote them.
+    records: [PcapngNameRecord]
+    // The block's options, which follow the records.
+    options: [PcapngOption]
+
+// What an Interface Statistics Block said about one interface over
+// one stretch of the capture.
+//
+// ```novo
+// use pcapngblock
+// use pcapts
+//
+// fn main() [io]
+//     let s = pcapngblock.statistics(0, pcapts.timestamp(0), [])
+//     println("${s.interface_id}")                    // 0
+// ```
+pub struct PcapngStatistics
+    // Which interface of the section these counts are for.
+    interface_id: Int
+    // When the block was written, as a count of ticks at that
+    // interface's resolution.
+    timestamp: PcapTimestamp
+    // The counts, which are all options: `isb_ifrecv`, `isb_ifdrop`,
+    // `isb_osdrop`, `isb_filteraccept`, `isb_usrdeliv`, and the two
+    // instants bounding the stretch.
+    options: [PcapngOption]
+
+// What a Custom Block said before its private data.
+//
+// The data itself is not here: it may be any size, and it arrives
+// from the reader as spans into the caller's chunk, the same way a
+// packet's octets do.
+//
+// ```novo
+// use pcapngblock
+//
+// fn main() [io]
+//     let c = pcapngblock.custom(32473, true, 16, 1024)
+//     println("${c.enterprise}")                      // 32473
+// ```
+pub struct PcapngCustom
+    // The IANA Private Enterprise Number of whoever defined the
+    // content.  It is the only thing that says what the data is, and
+    // a reader that does not recognise it must not try.
+    enterprise: Int
+    // Whether a program rewriting this file may copy the block into
+    // the new one.  False for the 0x40000BAD form, which exists for
+    // content a rewriter would be wrong to carry over.
+    copiable: Bool
+    // How many octets of private data follow.
+    data_length: Int
+    // Where those octets begin in the stream.
+    data_at: Int
+
+// The 32-bit type a block kind is written as.
+//
+// ```novo
+// use pcapngblock
+//
+// fn main() [io]
+//     println("${pcapngblock.block_code(PcapngSectionHeader)}")   // 168627466
+// ```
+pub fn block_code(k: PcapngBlockType) -> Int
+    todo("pcapfile-nv.pcapngblock.block_code")
+
+// The block kind a 32-bit type denotes.
+//
+// Every value answers something, because a block type this package
+// has never seen is still a block a reader steps over.
+//
+// ```novo
+// use pcapngblock
+//
+// fn main() [io]
+//     match pcapngblock.block_type(6)
+//         PcapngEnhancedPacket => println("a packet")
+//         _                    => println("something else")
+// ```
+pub fn block_type(code: Int) -> PcapngBlockType
+    todo("pcapfile-nv.pcapngblock.block_type")
+
+// The specification's name for a block kind: `"SHB"`, `"IDB"`,
+// `"EPB"`, and so on.
+//
+// ```novo
+// use pcapngblock
+//
+// fn main() [io]
+//     println(pcapngblock.block_name(PcapngInterfaceStatistics))  // ISB
+// ```
+pub fn block_name(k: PcapngBlockType) -> Str
+    todo("pcapfile-nv.pcapngblock.block_name")
+
+// Block framing.
+//
+// ```novo
+// use pcapngblock
+//
+// fn main() [io]
+//     println("${pcapngblock.block(PcapngSimplePacket, 128, 24).total_length}")
+// ```
+pub fn block(kind: PcapngBlockType, total_length: Int, at: Int) -> PcapngBlock
+    todo("pcapfile-nv.pcapngblock.block")
+
+// Whether this kind of block carries captured packet octets.
+//
+// True for the Enhanced Packet Block, the Simple Packet Block and the
+// obsolete Packet Block.  It is what a reader asks before deciding
+// whether to hand the body over as spans or to buffer it.
+//
+// ```novo
+// use pcapngblock
+//
+// fn main() [io]
+//     println("${pcapngblock.carries_packet(PcapngSimplePacket)}")  // true
+//     println("${pcapngblock.carries_packet(PcapngNameResolution)}")
+// ```
+pub fn carries_packet(k: PcapngBlockType) -> Bool
+    todo("pcapfile-nv.pcapngblock.carries_packet")
+
+// Whether this package decodes the block, rather than naming it and
+// stepping over it.
+//
+// True for the Section Header, Interface Description, Enhanced
+// Packet, Simple Packet, Name Resolution, Interface Statistics and
+// Custom blocks.  False for the obsolete Packet Block and for every
+// type this package has not heard of, both of which reach a caller as
+// `PcapSkipped` with their kind and their length.
+//
+// ```novo
+// use pcapngblock
+//
+// fn main() [io]
+//     println("${pcapngblock.is_decoded(PcapngObsoletePacket)}")   // false
+// ```
+pub fn is_decoded(k: PcapngBlockType) -> Bool
+    todo("pcapfile-nv.pcapngblock.is_decoded")
+
+// A section.
+//
+// ```novo
+// use pcapngblock
+// use pcapbyte
+//
+// fn main() [io]
+//     let s = pcapngblock.section(PcapBigEndian, 1, 0, Some(4096), [], 0)
+//     match s.length
+//         Some(n) => println("${n}")                  // 4096
+//         None    => println("the writer did not know")
+// ```
+pub fn section(order: PcapByteOrder, version_major: Int, version_minor: Int, length: ?Int,
+               options: [PcapngOption], at: Int) -> PcapngSection
+    todo("pcapfile-nv.pcapngblock.section")
+
+// A section read out of a Section Header Block's body.
+//
+// The body is everything after the block type and the leading total
+// length.  `PcapBadByteOrderMagic` when the first four octets are not
+// 0x1A2B3C4D either way round — which is the one check that
+// establishes the section's byte order, and therefore the one check
+// that cannot be done in a byte order.
+//
+// `PcapBadVersion` for a major version that is not 1.
+//
+// ```novo
+// use pcapngblock
+//
+// fn main() [io]
+//     match pcapngblock.parse_section(list.zeros(16), 0)
+//         Ok(s)  => println("${s.version_major}")
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_section(body: [u8], at: Int) -> Result<PcapngSection, PcapError>
+    todo("pcapfile-nv.pcapngblock.parse_section")
+
+// The section length, or `None` for the -1 that means the writer did
+// not know.
+//
+// A separate function from the field because the field already holds
+// the answer; this is the rule that produced it, kept where a reader
+// of the signatures meets it.  A capture still being written has -1
+// here, and so does every capture written to a pipe.
+//
+// ```novo
+// use pcapngblock
+// use pcapbyte
+//
+// fn main() [io]
+//     let s = pcapngblock.section(PcapLittleEndian, 1, 0, None, [], 0)
+//     match pcapngblock.section_length(s)
+//         Some(n) => println("${n}")
+//         None    => println("unknown, which is the common case")
+// ```
+pub fn section_length(s: PcapngSection) -> ?Int
+    todo("pcapfile-nv.pcapngblock.section_length")
+
+// An interface, with the specification's defaults filled in from the
+// options.
+//
+// `resolution` comes from `if_tsresol` and is microseconds when the
+// option is absent; `offset_seconds` comes from `if_tsoffset` and is
+// zero; `name` and `description` come from `if_name` and
+// `if_description` and are `""`; `fcs_length` comes from `if_fcslen`
+// and is `None`.
+//
+// ```novo
+// use pcapngblock
+// use pcaplink
+// use pcapts
+//
+// fn main() [io]
+//     let i = pcapngblock.interface(0, PcapLinkEthernet, 262144, [])
+//     println("${pcapts.ticks_per_second(i.resolution)}")   // 1000000
+// ```
+pub fn interface(id: Int, link_type: PcapLinkType, snap_length: Int,
+                 options: [PcapngOption]) -> PcapngInterface
+    todo("pcapfile-nv.pcapngblock.interface")
+
+// An interface read out of an Interface Description Block's body.
+//
+// `id` is the caller's: it is the interface's position in its
+// section, which the block itself does not carry.
+//
+// `PcapBadResolution` for an `if_tsresol` a 64-bit tick count cannot
+// address.
+//
+// ```novo
+// use pcapngblock
+// use pcapbyte
+//
+// fn main() [io]
+//     match pcapngblock.parse_interface(list.zeros(8), PcapLittleEndian, 0, 64, 0)
+//         Ok(i)  => println("${i.snap_length}")
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_interface(body: [u8], ord: PcapByteOrder, id: Int, option_limit: Int,
+                       at: Int) -> Result<PcapngInterface, PcapError>
+    todo("pcapfile-nv.pcapngblock.parse_interface")
+
+// A name resolution record.
+//
+// ```novo
+// use pcapngblock
+//
+// fn main() [io]
+//     let r = pcapngblock.name_record(2, list.zeros(16), ["ada.example"])
+//     println("${r.record_type}")                     // 2
+// ```
+pub fn name_record(record_type: Int, address: [u8], names: [Str]) -> PcapngNameRecord
+    todo("pcapfile-nv.pcapngblock.name_record")
+
+// A name resolution block's contents.
+//
+// ```novo
+// use pcapngblock
+//
+// fn main() [io]
+//     println("${list.len(pcapngblock.name_resolution([], []).options)}")
+// ```
+pub fn name_resolution(records: [PcapngNameRecord], options: [PcapngOption]) -> PcapngNameResolution
+    todo("pcapfile-nv.pcapngblock.name_resolution")
+
+// A Name Resolution Block read out of its body.
+//
+// The records run until a record of type 0, which is the end marker,
+// and the options follow it.  `PcapBadNameRecord` for a record whose
+// length runs past the block, for an IPv4 record whose address is not
+// four octets, and for an IPv6 record whose address is not sixteen.
+//
+// ```novo
+// use pcapngblock
+// use pcapbyte
+//
+// fn main() [io]
+//     match pcapngblock.parse_name_resolution(list.zeros(4), PcapLittleEndian, 64, 0)
+//         Ok(n)  => println("${list.len(n.records)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_name_resolution(body: [u8], ord: PcapByteOrder, option_limit: Int,
+                             at: Int) -> Result<PcapngNameResolution, PcapError>
+    todo("pcapfile-nv.pcapngblock.parse_name_resolution")
+
+// Interface statistics.
+//
+// ```novo
+// use pcapngblock
+// use pcapts
+//
+// fn main() [io]
+//     println("${pcapngblock.statistics(1, pcapts.timestamp(0), []).interface_id}")
+// ```
+pub fn statistics(interface_id: Int, t: PcapTimestamp, options: [PcapngOption]) -> PcapngStatistics
+    todo("pcapfile-nv.pcapngblock.statistics")
+
+// An Interface Statistics Block read out of its body.
+//
+// ```novo
+// use pcapngblock
+// use pcapbyte
+//
+// fn main() [io]
+//     match pcapngblock.parse_statistics(list.zeros(12), PcapLittleEndian, 64, 0)
+//         Ok(s)  => println("${s.interface_id}")
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_statistics(body: [u8], ord: PcapByteOrder, option_limit: Int,
+                        at: Int) -> Result<PcapngStatistics, PcapError>
+    todo("pcapfile-nv.pcapngblock.parse_statistics")
+
+// How many packets the interface received over this stretch, from
+// `isb_ifrecv`, or `None` when the block did not say.
+//
+// ```novo
+// use pcapngblock
+// use pcapbyte
+// use pcapts
+//
+// fn main() [io]
+//     let s = pcapngblock.statistics(0, pcapts.timestamp(0), [])
+//     match pcapngblock.packets_received(s, PcapLittleEndian)
+//         Some(n) => println("${n}")
+//         None    => println("the block carried no isb_ifrecv")
+// ```
+pub fn packets_received(s: PcapngStatistics, ord: PcapByteOrder) -> ?Int
+    todo("pcapfile-nv.pcapngblock.packets_received")
+
+// How many packets the interface dropped over this stretch, from
+// `isb_ifdrop`, or `None` when the block did not say.
+//
+// The number that decides whether a capture may be reasoned about.  A
+// capture that dropped packets is missing traffic that was there, and
+// every conclusion drawn from it about what did not happen is wrong.
+// Most tools never show it.
+//
+// ```novo
+// use pcapngblock
+// use pcapbyte
+// use pcapts
+//
+// fn main() [io]
+//     let s = pcapngblock.statistics(0, pcapts.timestamp(0), [])
+//     match pcapngblock.packets_dropped(s, PcapLittleEndian)
+//         Some(n) => println("${n}")
+//         None    => println("the block carried no isb_ifdrop")
+// ```
+pub fn packets_dropped(s: PcapngStatistics, ord: PcapByteOrder) -> ?Int
+    todo("pcapfile-nv.pcapngblock.packets_dropped")
+
+// A custom block's header.
+//
+// ```novo
+// use pcapngblock
+//
+// fn main() [io]
+//     println("${pcapngblock.custom(32473, false, 0, 0).copiable}")   // false
+// ```
+pub fn custom(enterprise: Int, copiable: Bool, data_length: Int, data_at: Int) -> PcapngCustom
+    todo("pcapfile-nv.pcapngblock.custom")

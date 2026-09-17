@@ -1,0 +1,186 @@
+// pcaperror.nv — every way a capture file can be refused, and the
+// offset the refusal happened at.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A REFUSAL CARRIES AN OFFSET
+//
+// A capture file is read from the front, and a fault in one is almost
+// always local: one block whose two length fields disagree, one record
+// claiming more octets than the file has left, one option running past
+// the end of its block.  The rest of the file is usually fine, and the
+// person holding it wants to know where to cut.  So every variant here
+// carries `at`, the offset from the first byte the reader was ever
+// given, and `pcaperror.at` reads it back without a match.
+//
+// RUNNING OUT OF BYTES IS NOT A FAULT, AND IS NOT HERE
+//
+// A reader that has been given half a block has been given half a
+// block.  On a file that is still being written, and on a socket
+// carrying `tcpdump -w -`, that is the ordinary case, and it is
+// reported by the reader producing no event rather than by an error.
+// `PcapTruncated` is the different thing: the stream ENDED in the
+// middle of a block, which is what `pcapread.finish` answers and what
+// a caller reports as a damaged file.
+
+// Why a capture file, a block or a record was refused.
+//
+// ```novo
+// use pcaperror
+//
+// fn main() [io]
+//     println(PcapBadMagic(0, 305419896).message())
+// ```
+pub enum PcapError
+    // The first four octets are none of the four classic magic
+    // numbers and none of the pcapng Section Header Block type.
+    // `word` is what was there, read as a big-endian 32-bit value, so
+    // a log can show it whichever way round the file was.
+    PcapBadMagic(at: Int, word: Int)
+    // The stream ended in the middle of something.  `wanted` is how
+    // many more octets the reader needed to finish what it was on and
+    // `had` is how many it was holding, so the message can say how
+    // much of the file is missing.  Answered by `pcapread.finish`,
+    // never by `pcapread.feed` — a short feed is not a short file.
+    PcapTruncated(at: Int, wanted: Int, had: Int)
+    // A pcapng block's leading and trailing Block Total Length fields
+    // disagree.  The trailing copy is what lets a reader walk a file
+    // backwards, so a mismatch means one of the two walks would read
+    // different blocks and neither can be trusted.
+    PcapLengthMismatch(at: Int, leading: Int, trailing: Int)
+    // A pcapng Block Total Length is not a multiple of four, or is
+    // smaller than the twelve octets of framing a block cannot be
+    // without.  Either one makes the block unwalkable.
+    PcapBadBlockLength(at: Int, total_length: Int)
+    // A Section Header Block's Byte-Order Magic is not 0x1A2B3C4D
+    // read either way round, so the section says nothing about which
+    // way its own integers lie.
+    PcapBadByteOrderMagic(at: Int, word: Int)
+    // The file's major version is not one this package reads.
+    // Classic pcap is 2.4 and pcapng is 1.0; a major version this
+    // package has never seen may have moved a field, so it is refused
+    // rather than guessed at.
+    PcapBadVersion(at: Int, major: Int, minor: Int)
+    // A record or block says its captured length is greater than its
+    // original length, which would mean more octets were saved than
+    // were ever on the wire.
+    PcapCapturedExceedsOriginal(at: Int, captured: Int, original: Int)
+    // A record's captured length is greater than the limit the caller
+    // gave the reader.  The limit is what stops a corrupt length field
+    // from becoming an allocation.
+    PcapCapturedTooLarge(at: Int, captured: Int, limit: Int)
+    // A block the reader decodes whole — a Section Header, an
+    // Interface Description, a Name Resolution or an Interface
+    // Statistics block — is larger than the caller's limit.  Packet
+    // blocks are not subject to it: their payload is never held.
+    PcapBlockTooLarge(at: Int, total_length: Int, limit: Int)
+    // A block holds more options than the caller's limit allows.
+    PcapTooManyOptions(at: Int, limit: Int)
+    // An option's length runs past the end of the block that holds
+    // it, or the options area ends without an `opt_endofopt`.
+    PcapBadOption(at: Int, code: Int, length: Int)
+    // An `if_tsresol` octet the timestamp rules cannot use: a decimal
+    // exponent above eighteen or a binary one above sixty-three
+    // describes a tick smaller than a 64-bit count can address.
+    PcapBadResolution(at: Int, tsresol: Int)
+    // An Enhanced Packet Block or an Interface Statistics Block names
+    // an interface the current section never described.  Interface
+    // identifiers are per-section and start at zero, so a file that
+    // carries one over a section boundary lands here.
+    PcapNoSuchInterface(at: Int, interface_id: Int)
+    // A packet block arrived before any Interface Description Block,
+    // so there is no link type and no timestamp resolution to read it
+    // with.
+    PcapNoInterface(at: Int)
+    // A Name Resolution Block's record is malformed: a length that
+    // runs past the block, an IPv4 record whose address is not four
+    // octets, or an IPv6 record whose address is not sixteen.
+    PcapBadNameRecord(at: Int, record_type: Int, length: Int)
+    // A writer was asked for something the format cannot hold: a
+    // length above 0xFFFFFFFF, a classic file header at a resolution
+    // that is neither microseconds nor nanoseconds, an option value
+    // longer than 65535 octets.  The only variant here that is the
+    // calling program's fault rather than the file's.
+    PcapUnwritable(at: Int, what: Str)
+
+// `PcapError` is an `Error`, which is what lets
+// `Result<T, PcapError>` exist at all (SPEC § 3.4).
+impl Error for PcapError
+    // The one-line message, naming the offset.
+    //
+    // Written for a log and for the person holding the file: it says
+    // what was expected, what was there and where, because a capture
+    // file is repaired by cutting at an offset and there is nothing
+    // else useful to say about a corrupt one.
+    //
+    // Panics with `not implemented` until the bodies land.
+    fn message(self) -> Str
+        todo("pcapfile-nv.PcapError.message")
+
+// The offset the refusal happened at, counted from the first octet
+// the reader was ever given.
+//
+// The same counter `pcapread.offset` answers, so a caller can seek to
+// it in the file it opened without keeping a count of its own.
+//
+// ```novo
+// use pcaperror
+//
+// fn main() [io]
+//     println("${pcaperror.at(PcapTruncated(2048, 16, 3))}")   // 2048
+// ```
+pub fn at(e: PcapError) -> Int
+    todo("pcapfile-nv.pcaperror.at")
+
+// A short stable code for metrics and logs: `"bad_magic"`,
+// `"truncated"`, `"length_mismatch"`, and so on.
+//
+// Stable across releases and free of anything the file carried, so it
+// is safe as a metric label.
+//
+// ```novo
+// use pcaperror
+//
+// fn main() [io]
+//     println(pcaperror.code(PcapNoInterface(28)))   // no_interface
+// ```
+pub fn code(e: PcapError) -> Str
+    todo("pcapfile-nv.pcaperror.code")
+
+// Whether the file simply stopped early, rather than saying something
+// impossible.
+//
+// True for `PcapTruncated` alone.  The distinction decides what a
+// tool does next: a capture cut short by a full disk or a killed
+// `tcpdump` is worth keeping up to the last complete packet, and
+// every other refusal here means the octets disagree with themselves
+// and the rest of the file is a guess.
+//
+// ```novo
+// use pcaperror
+//
+// fn main() [io]
+//     println("${pcaperror.is_truncation(PcapTruncated(2048, 16, 3))}")   // true
+//     println("${pcaperror.is_truncation(PcapNoInterface(28))}")          // false
+// ```
+pub fn is_truncation(e: PcapError) -> Bool
+    todo("pcapfile-nv.pcaperror.is_truncation")
+
+// Whether the refusal is the calling program's fault rather than the
+// file's.
+//
+// True for `PcapUnwritable` alone, which is what the writer answers
+// when it is asked for bytes the format cannot hold.  Every other
+// variant is a statement about octets that arrived from somewhere
+// else, and a program that logged the two together would be mixing
+// its own bugs into a report about a stranger's file.
+//
+// ```novo
+// use pcaperror
+//
+// fn main() [io]
+//     let e = PcapUnwritable(0, "snapshot length")
+//     println("${pcaperror.is_caller_fault(e)}")     // true
+// ```
+pub fn is_caller_fault(e: PcapError) -> Bool
+    todo("pcapfile-nv.pcaperror.is_caller_fault")

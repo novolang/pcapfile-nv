@@ -1,0 +1,139 @@
+// tests/pcapts_tests.nv — the resolutions, and the conversions that
+// take one as an argument because a timestamp does not carry it.
+//
+// They COMPILE today and they FAIL at run with `not implemented`.
+// The rules come from libpcap's two magic numbers and from the pcapng
+// specification's `if_tsresol`, section 4.2 option 9.
+
+use std.test
+use pcaperror
+use pcapts
+
+@test
+fn test_a_resolution_is_a_base_and_an_exponent_and_never_a_guess() [io]
+    test.case("the two named ones are the two a classic file can be")
+    test.assert(pcapts.ticks_per_second(pcapts.micros()) == 1000000)
+    test.assert(pcapts.ticks_per_second(pcapts.nanos()) == 1000000000)
+
+    test.case("and pcapng's binary form is a different base, not a different number")
+    // A reader that read the octet as a decimal exponent regardless
+    // reads a capture at 2^-16 seconds as one at 10^-16, which is off
+    // by ten orders of magnitude and still monotonic.
+    test.assert(pcapts.ticks_per_second(PcapBinaryResolution(16)) == 65536)
+    test.assert(pcapts.ticks_per_second(PcapDecimalResolution(3)) == 1000)
+
+@test
+fn test_the_tsresol_octets_top_bit_picks_the_base() [io]
+    test.case("a clear top bit is a power of ten")
+    match pcapts.resolution_of_tsresol(6)
+        Ok(r)  => test.assert(pcapts.ticks_per_second(r) == 1000000)
+        Err(_) => test.fail("6 is the specification's default")
+
+    test.case("a set top bit is a power of two: 0x80 + 16 is 2^-16")
+    match pcapts.resolution_of_tsresol(144)
+        Ok(r)  => test.assert(pcapts.ticks_per_second(r) == 65536)
+        Err(_) => test.fail("0x90 is a legal if_tsresol")
+
+    test.case("and an exponent a 64-bit count cannot address is refused")
+    match pcapts.resolution_of_tsresol(30)
+        Ok(_)  => test.fail("10^-30 seconds is not addressable")
+        Err(e) => test.assert(pcaperror.code(e) == "bad_resolution")
+
+    test.case("the octet comes back out the way it went in")
+    match pcapts.tsresol_octet(pcapts.micros())
+        Ok(b)  => test.assert(b == 6)
+        Err(_) => test.fail("microseconds are the default octet")
+
+@test
+fn test_a_resolution_finer_than_a_nanosecond_is_a_question_asked_first() [io]
+    // Both are legal in pcapng and neither survives a conversion to
+    // seconds and nanoseconds.  A program that must not lose
+    // precision keeps the tick count.
+    test.case("finer than a nanosecond, decimal and binary")
+    test.assert(pcapts.is_finer_than_nanosecond(PcapDecimalResolution(12)))
+    test.assert(pcapts.is_finer_than_nanosecond(PcapBinaryResolution(40)))
+
+    test.case("and not finer")
+    test.assert(not pcapts.is_finer_than_nanosecond(pcapts.nanos()))
+    test.assert(not pcapts.is_finer_than_nanosecond(pcapts.micros()))
+
+@test
+fn test_a_timestamp_is_a_count_and_the_resolution_is_an_argument() [io]
+    test.case("the count goes in and comes out")
+    test.assert(pcapts.ticks(pcapts.timestamp(1700000000000000)) == 1700000000000000)
+
+    test.case("the same count is two different instants at two resolutions")
+    // The whole reason the resolution travels separately: a reader
+    // that assumed microseconds turns a nanosecond capture into one a
+    // thousand times longer, with every packet still in order.
+    let t = pcapts.timestamp(1700000000000000)
+    test.assert(pcapts.to_unix(t, pcapts.micros(), 0).seconds == 1700000000)
+    test.assert(pcapts.to_unix(t, pcapts.nanos(), 0).seconds == 1700000)
+
+@test
+fn test_pcapng_splits_the_count_into_two_words_that_do_not_swap() [io]
+    // The halves are read as two unsigned 32-bit values in the
+    // section's byte order and then combined the same way whichever
+    // order that was.  A reader that swapped the two words for a
+    // little-endian section dates every packet to the wrong century.
+    test.case("a high word of one is 2^32 ticks")
+    test.assert(pcapts.ticks(pcapts.from_halves(1, 0)) == 4294967296)
+
+    test.case("and the halves come back for a writer")
+    let t = pcapts.timestamp(4294967297)
+    test.assert(pcapts.high_half(t) == 1)
+    test.assert(pcapts.low_half(t) == 1)
+
+@test
+fn test_the_interfaces_offset_is_part_of_the_answer() [io]
+    // `if_tsoffset` exists so a capture of a long run can use a small
+    // counter, and the writers that use it choose large numbers.  A
+    // reader that ignored it is wrong by whatever the writer chose.
+    test.case("the offset is added on the way out")
+    let t = pcapts.timestamp(500000)
+    test.assert(pcapts.to_unix(t, pcapts.micros(), 1700000000).seconds
+                == 1700000000)
+
+    test.case("and subtracted on the way in, so a round trip is the identity")
+    match pcapts.from_unix(pcapts.unix_time(1700000000, 500000000),
+                           pcapts.micros(), 1700000000)
+        Ok(back) => test.assert(pcapts.ticks(back) == 500000)
+        Err(_)   => test.fail("the instant is inside the interface's range")
+
+@test
+fn test_a_conversion_loses_what_the_resolution_cannot_hold_and_says_so() [io]
+    test.case("500 nanoseconds do not fit a microsecond tick")
+    let u = pcapts.unix_time(1700000000, 500)
+    test.assert(not pcapts.is_exact(u, pcapts.micros()))
+    test.assert(pcapts.is_exact(u, pcapts.nanos()))
+
+    test.case("and the conversion truncates rather than rounding up")
+    // Rounding up would move a packet past one that came after it,
+    // which reorders a capture that was in order.
+    match pcapts.from_unix(u, pcapts.micros(), 0)
+        Ok(t)  => test.assert(pcapts.ticks(t) == 1700000000000000)
+        Err(_) => test.fail("a lossy conversion is allowed; a silent one is not")
+
+    test.case("nanoseconds outside a second are the caller's mistake")
+    match pcapts.from_unix(pcapts.unix_time(0, 1000000000), pcapts.nanos(), 0)
+        Ok(_)  => test.fail("1000000000 nanoseconds is the next second")
+        Err(e) => test.assert(pcaperror.is_caller_fault(e))
+
+@test
+fn test_a_classic_records_two_fields_are_one_count_here() [io]
+    // A classic record writes whole seconds and a fraction in two
+    // 32-bit fields; a pcapng block writes one 64-bit count.  Both
+    // arrive as a `PcapTimestamp`, so a program that reads captures
+    // has one timestamp type and not two.
+    test.case("the two fields combine at the file's resolution")
+    let t = pcapts.from_classic(1700000000, 500000, pcapts.micros())
+    test.assert(pcapts.ticks(t) == 1700000000500000)
+
+    test.case("and split back for a writer")
+    test.assert(pcapts.classic_seconds(t, pcapts.micros()) == 1700000000)
+    test.assert(pcapts.classic_fraction(t, pcapts.micros()) == 500000)
+
+    test.case("the same fraction field is nanoseconds under the other magic")
+    let n = pcapts.from_classic(1700000000, 500000, pcapts.nanos())
+    test.assert(pcapts.classic_fraction(n, pcapts.nanos()) == 500000)
+    test.assert(pcapts.to_unix(n, pcapts.nanos(), 0).nanoseconds == 500000)

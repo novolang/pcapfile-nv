@@ -1,0 +1,190 @@
+// pcaplink.nv — what the captured octets of a packet are, before
+// anything looks at them.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE LINK TYPE IS THE ONLY THING THAT SAYS WHAT A PACKET IS
+//
+// A capture file holds octets and a number.  The number is the link
+// type, and without it the octets are unreadable: the same twenty
+// octets are an Ethernet frame under LINKTYPE_ETHERNET, an IPv4
+// datagram under LINKTYPE_RAW, and a cooked capture header under
+// LINKTYPE_LINUX_SLL.  Nothing in the octets themselves says which.
+// A reader that assumed Ethernet — which is the assumption almost
+// every hand-written capture reader makes — decodes a `tcpdump -i
+// any` capture into nonsense and reports no error at all.
+//
+// So the link type travels with every packet this package yields, and
+// it is the first argument packet-nv takes.
+//
+// THE NAMED ONES, AND THE NUMBER
+//
+// tcpdump.org's LINKTYPE registry has over three hundred entries and
+// grows.  An enum that tried to hold them all would be stale within a
+// year and would turn every new link type into a build failure for a
+// consumer that only wanted to skip it.  So six are named, because
+// they are the six a capture from a general-purpose machine is, and
+// everything else is `PcapLinkOther` carrying the number the file
+// wrote.  A consumer that understands a link type this package has
+// never heard of matches on the number and is not held up.
+
+// What the captured octets of a packet are.
+//
+// The numbers are the LINKTYPE values from tcpdump.org's link-layer
+// header types registry, which is also what both file formats write.
+//
+// ```novo
+// use pcaplink
+//
+// fn main() [io]
+//     println(pcaplink.link_name(PcapLinkEthernet))    // LINKTYPE_ETHERNET
+// ```
+pub enum PcapLinkType
+    // LINKTYPE_NULL, 0.  BSD loopback: four octets holding an address
+    // family, then an IPv4 or IPv6 datagram.  The four octets are in
+    // the byte order of the machine that captured them, which is the
+    // file's own order and not network order — `pcaplink.family_is_in_file_order`
+    // is the rule written down.
+    PcapLinkNull
+    // LINKTYPE_ETHERNET, 1.  An IEEE 802.3 Ethernet frame, starting
+    // at the destination address, with no preamble and no frame check
+    // sequence.
+    PcapLinkEthernet
+    // LINKTYPE_IEEE802_11, 105.  An IEEE 802.11 frame starting at the
+    // frame control field, with no radio information in front of it.
+    PcapLinkIeee80211
+    // LINKTYPE_RAW, 101.  An IPv4 or IPv6 datagram with no link-layer
+    // header at all; the version nibble of the first octet says which.
+    PcapLinkRaw
+    // LINKTYPE_LINUX_SLL, 113.  The sixteen-octet cooked header Linux
+    // writes when a capture is not tied to one interface, which is
+    // what `tcpdump -i any` produces.
+    PcapLinkLinuxSll
+    // LINKTYPE_LINUX_SLL2, 276.  The twenty-octet second version of
+    // the cooked header, which carries the interface index the first
+    // one left out.  A recent `tcpdump -i any` writes this one.
+    PcapLinkLinuxSll2
+    // Everything else, as the file wrote it.  The registry has over
+    // three hundred entries and a consumer that knows one matches on
+    // the number.
+    PcapLinkOther(code: Int)
+
+// The link type a LINKTYPE number denotes.
+//
+// Every number answers something: one of the six named arms, or
+// `PcapLinkOther` carrying the number. There is no failure case,
+// because a capture file is not wrong for holding a link type this
+// package has not heard of.
+//
+// ```novo
+// use pcaplink
+//
+// fn main() [io]
+//     println(pcaplink.link_name(pcaplink.link_type(113)))   // LINKTYPE_LINUX_SLL
+//     println(pcaplink.link_name(pcaplink.link_type(9)))     // LINKTYPE_9
+// ```
+pub fn link_type(code: Int) -> PcapLinkType
+    todo("pcapfile-nv.pcaplink.link_type")
+
+// The LINKTYPE number a link type is written as.
+//
+// The inverse of `link_type`, and what both writers put in the
+// classic file header's `network` field and the Interface
+// Description Block's `LinkType` field.
+//
+// ```novo
+// use pcaplink
+//
+// fn main() [io]
+//     println("${pcaplink.link_code(PcapLinkRaw)}")      // 101
+//     println("${pcaplink.link_code(PcapLinkOther(147))}")
+// ```
+pub fn link_code(l: PcapLinkType) -> Int
+    todo("pcapfile-nv.pcaplink.link_code")
+
+// The registry's name for a link type: `"LINKTYPE_ETHERNET"`,
+// `"LINKTYPE_LINUX_SLL"`, and so on.
+//
+// A link type this package does not name answers `"LINKTYPE_"`
+// followed by its number, so a message about an unknown capture still
+// says something a reader can look up.
+//
+// ```novo
+// use pcaplink
+//
+// fn main() [io]
+//     println(pcaplink.link_name(PcapLinkNull))         // LINKTYPE_NULL
+//     println(pcaplink.link_name(PcapLinkOther(276)))   // LINKTYPE_276
+// ```
+pub fn link_name(l: PcapLinkType) -> Str
+    todo("pcapfile-nv.pcaplink.link_name")
+
+// Whether this package names the link type, rather than carrying its
+// number.
+//
+// False for every `PcapLinkOther`.  A tool that wants to say "I can
+// decode this capture" asks this and then asks packet-nv; a tool that
+// only copies packets from one file to another does not need to ask
+// at all.
+//
+// ```novo
+// use pcaplink
+//
+// fn main() [io]
+//     println("${pcaplink.is_named(PcapLinkEthernet)}")    // true
+//     println("${pcaplink.is_named(PcapLinkOther(147))}")  // false
+// ```
+pub fn is_named(l: PcapLinkType) -> Bool
+    todo("pcapfile-nv.pcaplink.is_named")
+
+// How many octets of link-layer header come before the network-layer
+// header, when that is a fixed number.
+//
+// Four for LINKTYPE_NULL, fourteen for LINKTYPE_ETHERNET, zero for
+// LINKTYPE_RAW, sixteen for LINKTYPE_LINUX_SLL and twenty for
+// LINKTYPE_LINUX_SLL2.
+//
+// `None` where the length is not fixed, which is LINKTYPE_IEEE802_11
+// — an 802.11 header is between ten and thirty octets depending on
+// its frame control field — and every link type this package does not
+// name.  `None` means "read the header"; it does not mean "no
+// header".
+//
+// It is here so that a tool skipping to the IP header of a capture it
+// does not otherwise parse can do it without taking packet-nv.  A
+// tool that parses the frame takes packet-nv and never calls this.
+//
+// ```novo
+// use pcaplink
+//
+// fn main() [io]
+//     match pcaplink.fixed_header_length(PcapLinkEthernet)
+//         Some(n) => println("${n}")                 // 14
+//         None    => println("read the header to find out")
+// ```
+pub fn fixed_header_length(l: PcapLinkType) -> ?Int
+    todo("pcapfile-nv.pcaplink.fixed_header_length")
+
+// Whether the link-layer header carries a multi-octet field in the
+// FILE's byte order rather than in network order.
+//
+// True for LINKTYPE_NULL alone.  Its four leading octets are an
+// address family written by the capturing machine in that machine's
+// own byte order, and the file's byte order is that same machine's —
+// so the family is read with the order the magic number gave, not
+// with the big-endian order every other protocol field uses.  A
+// reader that read it big-endian sees family 33554432 instead of 2
+// and calls every loopback capture unknown.
+//
+// False for every other link type here.  A protocol field is network
+// order and stays network order.
+//
+// ```novo
+// use pcaplink
+//
+// fn main() [io]
+//     println("${pcaplink.family_is_in_file_order(PcapLinkNull)}")     // true
+//     println("${pcaplink.family_is_in_file_order(PcapLinkEthernet)}") // false
+// ```
+pub fn family_is_in_file_order(l: PcapLinkType) -> Bool
+    todo("pcapfile-nv.pcaplink.family_is_in_file_order")

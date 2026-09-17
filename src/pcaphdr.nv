@@ -1,0 +1,529 @@
+// pcaphdr.nv — the classic pcap file header, the four magic numbers,
+// and the packet value both formats drain into.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE MAGIC NUMBER CARRIES TWO FACTS AND THEY ARE INDEPENDENT
+//
+// A classic pcap file begins with four octets, and there are exactly
+// four values they may have.  Two of them are the same number written
+// the two ways round, and the other two are a different number
+// written the two ways round.  Which NUMBER it is says whether the
+// fraction field of every packet is microseconds or nanoseconds.
+// Which WAY ROUND it is says how every other integer in the file is
+// laid out.
+//
+//     octets         order            resolution
+//     A1 B2 C3 D4    big-endian       microseconds
+//     D4 C3 B2 A1    little-endian    microseconds
+//     A1 B2 3C 4D    big-endian       nanoseconds
+//     4D 3C B2 A1    little-endian    nanoseconds
+//
+// Two mistakes come out of collapsing those into one check.  A reader
+// that matches only the first two numbers reads every nanosecond
+// capture as microseconds: the timestamps stay ordered, stay
+// monotonic and are a thousand times too large, and the file looks
+// fine.  A reader that decides the byte order by comparing against
+// its own machine's word reads every foreign file backwards.  So
+// `PcapMagic` has four arms, and the two questions are two functions.
+//
+// THE PACKET IS ONE VALUE FOR BOTH FORMATS
+//
+// A classic record header and an Enhanced Packet Block carry the same
+// five facts: which interface, when, how much was saved, how much was
+// on the wire, and where the octets are.  A Simple Packet Block
+// carries three of them and is explicit about what it left out.  So
+// there is ONE `PcapPacket`, and a program that reads captures does
+// not have two code paths — which is the whole point of putting both
+// formats behind one reader.
+//
+// THE OCTETS ARE A SPAN, NOT A COPY
+//
+// `PcapPacket` does not hold the captured octets.  It says how many
+// there are and where they begin, and the reader hands them over as
+// `PcapSpan` values pointing into the chunk the caller just fed.  A
+// packet is up to 262144 octets under a common snapshot length and a
+// capture holds millions of them; a reader that copied each one would
+// spend the whole of its time doing that, and packet-nv would then
+// read the copy.
+
+// Which of the two capture file formats a stream is.
+//
+// ```novo
+// use pcaphdr
+//
+// fn main() [io]
+//     println(pcaphdr.format_name(PcapFormatClassic))   // pcap
+// ```
+pub enum PcapFormat
+    // Classic pcap: a 24-octet file header, then packet records back
+    // to back.  One link type and one snapshot length for the whole
+    // file, no options, no metadata and no way to append a second
+    // capture to it.
+    PcapFormatClassic
+    // pcapng: a sequence of blocks, each one length-delimited, each
+    // one skippable, grouped into sections that may each have their
+    // own byte order and their own interfaces.
+    PcapFormatNg
+
+// The four octets a classic pcap file begins with.
+//
+// ```novo
+// use pcaphdr
+//
+// fn main() [io]
+//     println("${pcaphdr.magic_word(PcapMagicNanosecond)}")
+// ```
+pub enum PcapMagic
+    // A1 B2 C3 D4.  Big-endian file, microsecond fractions.  The
+    // original, from the first release of libpcap.
+    PcapMagicMicrosecond
+    // D4 C3 B2 A1.  Little-endian file, microsecond fractions.  What
+    // almost every capture in existence is.
+    PcapMagicMicrosecondSwapped
+    // A1 B2 3C 4D.  Big-endian file, nanosecond fractions.
+    PcapMagicNanosecond
+    // 4D 3C B2 A1.  Little-endian file, nanosecond fractions.  What
+    // `tcpdump --nano` writes.
+    PcapMagicNanosecondSwapped
+
+// Where some octets lie, both in the caller's chunk and in the
+// stream.
+//
+// A span is the package's answer to holding a payload it does not
+// own.  `chunk_at` and `length` index the `[u8]` the caller passed to
+// the `pcapread.feed` that produced this span, and they are valid for
+// exactly as long as the caller keeps that list: until the next call.
+// `stream_at` is the same octets counted from the first octet the
+// reader was ever given, which is what a caller reports, seeks to, or
+// puts in an index.
+//
+// ```novo
+// use pcaphdr
+//
+// fn main() [io]
+//     let s = pcaphdr.span(16, 1514, 40)
+//     println("${s.chunk_at} ${s.length} ${s.stream_at}")
+// ```
+pub struct PcapSpan
+    // Where these octets begin in the chunk that was just fed.
+    chunk_at: Int
+    // How many octets.  Never zero: a reader with nothing to hand
+    // over produces no span at all.
+    length: Int
+    // Where the same octets begin in the whole stream.
+    stream_at: Int
+
+// Which block a packet came out of.
+//
+// It matters because the three carry different amounts of truth, and
+// a program that treats them alike writes a capture that says more
+// than it knows.
+//
+// ```novo
+// use pcaphdr
+//
+// fn main() [io]
+//     println("${pcaphdr.length_is_exact(PcapFromSimpleBlock)}")   // false
+// ```
+pub enum PcapPacketOrigin
+    // A classic pcap record: both lengths present, one interface, the
+    // file's own resolution.
+    PcapFromClassicRecord
+    // A pcapng Enhanced Packet Block: both lengths present, a named
+    // interface, that interface's resolution, and options after the
+    // payload.
+    PcapFromEnhancedBlock
+    // A pcapng Simple Packet Block: the original length present, NO
+    // captured length and NO timestamp.  The captured length is
+    // derived from the block's total length, which includes padding,
+    // so it is exact only when the interface's snapshot length says
+    // the packet was not truncated.
+    PcapFromSimpleBlock
+
+// One captured packet, from either format.
+//
+// Everything a program needs to decide whether to look at the octets,
+// and nothing that requires having looked at them.
+//
+// ```novo
+// use pcaphdr
+// use pcapts
+//
+// fn main() [io]
+//     let p = pcaphdr.packet(0, pcapts.timestamp(1700000000000000),
+//                            98, 98, 40, PcapFromClassicRecord)
+//     println("${p.captured_length} of ${p.original_length}")
+// ```
+pub struct PcapPacket
+    // Which interface of the current section captured it.  Always 0
+    // for a classic pcap file, which has one interface it never
+    // names, and for a Simple Packet Block, which does not say.
+    interface_id: Int
+    // When, as a count of ticks at the interface's resolution.  Zero
+    // for a Simple Packet Block, which carries no timestamp at all —
+    // `pcaphdr.has_timestamp` is what says so, and a program that
+    // read the zero as an instant would date every such packet to
+    // 1970.
+    timestamp: PcapTimestamp
+    // How many octets were saved, which is how many the payload spans
+    // will add up to.
+    captured_length: Int
+    // How many octets were on the wire.  Greater than
+    // `captured_length` when the capture was truncated by the
+    // snapshot length, and a program reporting traffic volume must
+    // use this one.
+    original_length: Int
+    // Where the captured octets begin in the stream.  The same number
+    // the first payload span's `stream_at` carries, and it is here so
+    // that a caller building an index can record a packet's position
+    // without waiting for its octets.
+    payload_at: Int
+    // Which block carried it.
+    origin: PcapPacketOrigin
+
+// The classic pcap file header: the 24 octets at the front of the
+// file.
+//
+// ```novo
+// use pcaphdr
+// use pcaplink
+//
+// fn main() [io]
+//     let h = pcaphdr.file_header(PcapMagicMicrosecondSwapped,
+//                                 262144, PcapLinkEthernet)
+//     println("${h.snap_length} ${pcaplink.link_name(h.link_type)}")
+// ```
+pub struct PcapFileHeader
+    // The four octets the file begins with, which carry its byte
+    // order and its timestamp resolution.
+    magic: PcapMagic
+    // The major version.  2 in every file; this package refuses
+    // anything else.
+    version_major: Int
+    // The minor version.  4 in every file written since 1998.
+    version_minor: Int
+    // A correction in seconds from the timestamps to UTC.  Signed,
+    // and zero in every file any current tool writes — libpcap has
+    // never set it — but it is a field and a reader that dropped it
+    // would be discarding the one thing an old capture said about its
+    // own clock.
+    this_zone: Int
+    // The claimed accuracy of the timestamps, in the same units as
+    // the fraction field.  Zero in every file any current tool
+    // writes.
+    sig_figs: Int
+    // The snapshot length: the most octets the capture was willing to
+    // save from any one packet.  A packet whose original length is
+    // greater than this was truncated.
+    snap_length: Int
+    // What the captured octets of every packet in this file are.  One
+    // link type for the whole file, which is the limitation pcapng
+    // was invented to remove.
+    link_type: PcapLinkType
+
+// The format a stream's first octets say it is.
+//
+// `PcapFormatNg` when the first four octets are 0A 0D 0D 0A, the
+// pcapng Section Header Block type — which is a palindrome on
+// purpose, so that the block type itself reads the same whichever way
+// round the section turns out to be.  `PcapFormatClassic` when they
+// are one of the four classic magic numbers.
+//
+// `PcapBadMagic` for anything else, which is what a caller gets for
+// handing this package a gzipped capture, an ERF file, or a text log.
+// `None`-shaped guessing is deliberately absent: there is no fifth
+// thing a capture file can be.
+//
+// ```novo
+// use pcaphdr
+//
+// fn main() [io]
+//     let b = [0x0A as u8, 0x0D as u8, 0x0D as u8, 0x0A as u8]
+//     match pcaphdr.format_of(b)
+//         Ok(f)  => println(pcaphdr.format_name(f))     // pcapng
+//         Err(e) => println(e.message())
+// ```
+pub fn format_of(first_four: [u8]) -> Result<PcapFormat, PcapError>
+    todo("pcapfile-nv.pcaphdr.format_of")
+
+// The format's name, for a log: `"pcap"` or `"pcapng"`.
+//
+// ```novo
+// use pcaphdr
+//
+// fn main() [io]
+//     println(pcaphdr.format_name(PcapFormatNg))        // pcapng
+// ```
+pub fn format_name(f: PcapFormat) -> Str
+    todo("pcapfile-nv.pcaphdr.format_name")
+
+// The magic four octets, as they lie in the file.
+//
+// The octets and not a number, because a number would have to be read
+// in some order and the whole job of these four octets is to say what
+// that order is.
+//
+// ```novo
+// use pcaphdr
+//
+// fn main() [io]
+//     println("${list.len(pcaphdr.magic_bytes(PcapMagicNanosecond))}")   // 4
+// ```
+pub fn magic_bytes(m: PcapMagic) -> [u8]
+    todo("pcapfile-nv.pcaphdr.magic_bytes")
+
+// The magic as a 32-bit value read big-endian: 0xA1B2C3D4,
+// 0xD4C3B2A1, 0xA1B23C4D or 0x4D3CB2A1.
+//
+// For a log and for a comparison against a constant somebody has
+// written down.  Reading is `magic_of`, which takes the octets.
+//
+// ```novo
+// use pcaphdr
+//
+// fn main() [io]
+//     println("${pcaphdr.magic_word(PcapMagicMicrosecond)}")   // 2712847316
+// ```
+pub fn magic_word(m: PcapMagic) -> Int
+    todo("pcapfile-nv.pcaphdr.magic_word")
+
+// The magic four octets denote, or `PcapBadMagic`.
+//
+// The octets are compared as they lie.  Nothing about the reading
+// machine takes part, which is the difference between this and the
+// `if (magic == 0xa1b2c3d4)` that every hand-written capture reader
+// starts with.
+//
+// ```novo
+// use pcaphdr
+//
+// fn main() [io]
+//     let b = [0x4D as u8, 0x3C as u8, 0xB2 as u8, 0xA1 as u8]
+//     match pcaphdr.magic_of(b)
+//         Ok(m)  => println("${pcaphdr.magic_word(m)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn magic_of(first_four: [u8]) -> Result<PcapMagic, PcapError>
+    todo("pcapfile-nv.pcaphdr.magic_of")
+
+// Which way round every other integer in the file lies.
+//
+// One of the two facts the magic carries, and the one a reader needs
+// before it can read anything else.
+//
+// ```novo
+// use pcaphdr
+// use pcapbyte
+//
+// fn main() [io]
+//     println(pcapbyte.order_name(
+//         pcaphdr.magic_order(PcapMagicNanosecondSwapped)))    // little-endian
+// ```
+pub fn magic_order(m: PcapMagic) -> PcapByteOrder
+    todo("pcapfile-nv.pcaphdr.magic_order")
+
+// What one tick of every timestamp in the file is.
+//
+// Microseconds for the two 0xA1B2C3D4 forms and nanoseconds for the
+// two 0xA1B23C4D forms.  The other fact the magic carries, and the
+// one that is silently wrong when it is missed.
+//
+// ```novo
+// use pcaphdr
+// use pcapts
+//
+// fn main() [io]
+//     println("${pcapts.ticks_per_second(
+//         pcaphdr.magic_resolution(PcapMagicNanosecond))}")     // 1000000000
+// ```
+pub fn magic_resolution(m: PcapMagic) -> PcapResolution
+    todo("pcapfile-nv.pcaphdr.magic_resolution")
+
+// The magic for a byte order and a resolution, for a writer.
+//
+// `PcapUnwritable` for any resolution but microseconds and
+// nanoseconds.  The classic format has four magic numbers and no
+// fifth, so a caller holding a capture at 2^-16 seconds has to choose
+// what to lose — and being made to choose is the point, because the
+// alternative is a file whose timestamps are wrong by a factor
+// nothing records.
+//
+// ```novo
+// use pcaphdr
+// use pcapbyte
+// use pcapts
+//
+// fn main() [io]
+//     match pcaphdr.magic_for(PcapLittleEndian, pcapts.nanos())
+//         Ok(m)  => println("${pcaphdr.magic_word(m)}")
+//         Err(e) => println(e.message())
+// ```
+pub fn magic_for(o: PcapByteOrder, r: PcapResolution) -> Result<PcapMagic, PcapError>
+    todo("pcapfile-nv.pcaphdr.magic_for")
+
+// A classic file header, with the version 2.4 and `this_zone` and
+// `sig_figs` zero.
+//
+// The three arguments are the three fields anybody sets.  A caller
+// that needs the other three writes the struct out.
+//
+// ```novo
+// use pcaphdr
+// use pcaplink
+//
+// fn main() [io]
+//     let h = pcaphdr.file_header(PcapMagicMicrosecondSwapped,
+//                                 262144, PcapLinkEthernet)
+//     println("${h.version_major}.${h.version_minor}")     // 2.4
+// ```
+pub fn file_header(m: PcapMagic, snap_length: Int, l: PcapLinkType) -> PcapFileHeader
+    todo("pcapfile-nv.pcaphdr.file_header")
+
+// A classic file header read out of 24 octets.
+//
+// For a caller that already holds the front of a file and does not
+// want a reader.  `PcapTruncated` for fewer than 24 octets,
+// `PcapBadMagic` for a front that is not a classic capture, and
+// `PcapBadVersion` for a major version that is not 2.
+//
+// ```novo
+// use pcaphdr
+//
+// fn main() [io]
+//     match pcaphdr.parse_file_header(list.zeros(24))
+//         Ok(h)  => println("${h.snap_length}")
+//         Err(e) => println(e.message())
+// ```
+pub fn parse_file_header(bytes: [u8]) -> Result<PcapFileHeader, PcapError>
+    todo("pcapfile-nv.pcaphdr.parse_file_header")
+
+// Which way round this file's integers lie.
+//
+// ```novo
+// use pcaphdr
+// use pcapbyte
+// use pcaplink
+//
+// fn main() [io]
+//     let h = pcaphdr.file_header(PcapMagicMicrosecond, 65535, PcapLinkRaw)
+//     println(pcapbyte.order_name(pcaphdr.header_order(h)))    // big-endian
+// ```
+pub fn header_order(h: PcapFileHeader) -> PcapByteOrder
+    todo("pcapfile-nv.pcaphdr.header_order")
+
+// What one tick of this file's timestamps is.
+//
+// The resolution every packet in a classic file is at, because a
+// classic file has one interface and no way to say otherwise.
+//
+// ```novo
+// use pcaphdr
+// use pcaplink
+// use pcapts
+//
+// fn main() [io]
+//     let h = pcaphdr.file_header(PcapMagicNanosecond, 65535, PcapLinkRaw)
+//     println("${pcapts.ticks_per_second(pcaphdr.header_resolution(h))}")
+// ```
+pub fn header_resolution(h: PcapFileHeader) -> PcapResolution
+    todo("pcapfile-nv.pcaphdr.header_resolution")
+
+// A span.
+//
+// ```novo
+// use pcaphdr
+//
+// fn main() [io]
+//     println("${pcaphdr.span(16, 1514, 40).length}")     // 1514
+// ```
+pub fn span(chunk_at: Int, length: Int, stream_at: Int) -> PcapSpan
+    todo("pcapfile-nv.pcaphdr.span")
+
+// One past the last octet of a span, in the chunk it points into.
+//
+// What a caller slicing its own chunk needs, and the arithmetic worth
+// writing once.
+//
+// ```novo
+// use pcaphdr
+//
+// fn main() [io]
+//     println("${pcaphdr.span_end(pcaphdr.span(16, 1514, 40))}")   // 1530
+// ```
+pub fn span_end(s: PcapSpan) -> Int
+    todo("pcapfile-nv.pcaphdr.span_end")
+
+// A packet.
+//
+// ```novo
+// use pcaphdr
+// use pcapts
+//
+// fn main() [io]
+//     let p = pcaphdr.packet(0, pcapts.timestamp(0), 98, 98, 40,
+//                            PcapFromClassicRecord)
+//     println("${p.payload_at}")                     // 40
+// ```
+pub fn packet(interface_id: Int, t: PcapTimestamp, captured_length: Int, original_length: Int,
+              payload_at: Int, origin: PcapPacketOrigin) -> PcapPacket
+    todo("pcapfile-nv.pcaphdr.packet")
+
+// Whether the packet was cut short by the capture's snapshot length.
+//
+// True when the captured length is less than the original length.  A
+// program that reassembles a stream, checks a checksum or reads a
+// payload has to ask, because every one of those silently gets the
+// wrong answer on a truncated packet.
+//
+// ```novo
+// use pcaphdr
+// use pcapts
+//
+// fn main() [io]
+//     let p = pcaphdr.packet(0, pcapts.timestamp(0), 96, 1514, 40,
+//                            PcapFromClassicRecord)
+//     println("${pcaphdr.is_truncated(p)}")           // true
+// ```
+pub fn is_truncated(p: PcapPacket) -> Bool
+    todo("pcapfile-nv.pcaphdr.is_truncated")
+
+// Whether the packet carries an instant, rather than a zero standing
+// in for one.
+//
+// False for a Simple Packet Block and true for everything else.  A
+// Simple Packet Block has no timestamp field, so its `timestamp` is
+// zero — and a program that plotted packets over time without asking
+// would put a whole capture at the Unix epoch.
+//
+// ```novo
+// use pcaphdr
+// use pcapts
+//
+// fn main() [io]
+//     let p = pcaphdr.packet(0, pcapts.timestamp(0), 98, 98, 40,
+//                            PcapFromSimpleBlock)
+//     println("${pcaphdr.has_timestamp(p)}")          // false
+// ```
+pub fn has_timestamp(p: PcapPacket) -> Bool
+    todo("pcapfile-nv.pcaphdr.has_timestamp")
+
+// Whether the captured length is a fact the file stated, rather than
+// one derived from a block's total length.
+//
+// False for `PcapFromSimpleBlock` alone.  A Simple Packet Block does
+// not write a captured length: a reader computes it as the block's
+// total length less sixteen octets of framing, and that figure
+// INCLUDES the padding to a 32-bit boundary.  So it is exact only
+// when the packet was not truncated, and a reader bounds it by the
+// interface's snapshot length to get the rest of the way.
+//
+// ```novo
+// use pcaphdr
+//
+// fn main() [io]
+//     println("${pcaphdr.length_is_exact(PcapFromEnhancedBlock)}")  // true
+//     println("${pcaphdr.length_is_exact(PcapFromSimpleBlock)}")    // false
+// ```
+pub fn length_is_exact(o: PcapPacketOrigin) -> Bool
+    todo("pcapfile-nv.pcaphdr.length_is_exact")

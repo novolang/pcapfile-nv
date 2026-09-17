@@ -1,0 +1,196 @@
+// tests/pcaphdr_tests.nv — the four magic numbers, the classic file
+// header, and the packet both formats drain into.
+//
+// They COMPILE today and they FAIL at run with `not implemented`.
+// The vectors are the four magic numbers of libpcap's `savefile.c`
+// and the 24-octet header libpcap's `pcap_file_header` writes.
+
+use std.test
+use pcapbyte
+use pcaperror
+use pcaphdr
+use pcaplink
+use pcapts
+
+// The four octets of the microsecond magic, big-endian: A1 B2 C3 D4.
+fn micro_magic_bytes() -> [u8]
+    [0xA1 as u8, 0xB2 as u8, 0xC3 as u8, 0xD4 as u8]
+
+// The four octets of the nanosecond magic, little-endian: 4D 3C B2 A1.
+// What `tcpdump --nano` writes on a common machine.
+fn nano_swapped_bytes() -> [u8]
+    [0x4D as u8, 0x3C as u8, 0xB2 as u8, 0xA1 as u8]
+
+@test
+fn test_the_magic_carries_two_independent_facts() [io]
+    // The mistake this splits in two: a reader that matched one
+    // number and then decided the byte order by comparing against its
+    // own machine's word gets both answers from one comparison, and
+    // both are wrong on half the files in the world.
+    test.case("the byte order comes from the magic and nothing else")
+    test.assert(pcapbyte.order_name(pcaphdr.magic_order(PcapMagicMicrosecond))
+                == "big-endian")
+    test.assert(pcapbyte.order_name(pcaphdr.magic_order(PcapMagicNanosecondSwapped))
+                == "little-endian")
+
+    test.case("and the resolution comes from the magic and nothing else")
+    test.assert(pcapts.ticks_per_second(
+        pcaphdr.magic_resolution(PcapMagicMicrosecondSwapped)) == 1000000)
+    test.assert(pcapts.ticks_per_second(
+        pcaphdr.magic_resolution(PcapMagicNanosecond)) == 1000000000)
+
+@test
+fn test_the_magic_is_matched_as_it_lies() [io]
+    test.case("A1 B2 C3 D4 is the big-endian microsecond file")
+    match pcaphdr.magic_of(micro_magic_bytes())
+        Ok(m)  => test.assert(pcaphdr.magic_word(m) == 2712847316)
+        Err(_) => test.fail("the original libpcap magic is a magic")
+
+    test.case("4D 3C B2 A1 is the little-endian nanosecond file")
+    match pcaphdr.magic_of(nano_swapped_bytes())
+        Ok(m)  => test.assert(pcapts.ticks_per_second(
+                      pcaphdr.magic_resolution(m)) == 1000000000)
+        Err(_) => test.fail("tcpdump --nano writes this one")
+
+    test.case("and the octets come back out the way they went in")
+    test.assert(list.len(pcaphdr.magic_bytes(PcapMagicNanosecond)) == 4)
+
+@test
+fn test_a_front_that_is_not_a_capture_is_refused_by_name() [io]
+    test.case("a gzip member is not a capture file")
+    // 1F 8B 08 00: the front of every gzipped capture anybody has
+    // ever handed a capture reader.
+    let gz = [0x1F as u8, 0x8B as u8, 0x08 as u8, 0x00 as u8]
+    match pcaphdr.format_of(gz)
+        Ok(_)  => test.fail("a gzip member is not a capture file")
+        Err(e) => test.assert(pcaperror.code(e) == "bad_magic")
+
+    test.case("0A 0D 0D 0A is pcapng, and the type is a palindrome on purpose")
+    let shb = [0x0A as u8, 0x0D as u8, 0x0D as u8, 0x0A as u8]
+    match pcaphdr.format_of(shb)
+        Ok(f)  => test.assert(pcaphdr.format_name(f) == "pcapng")
+        Err(_) => test.fail("the Section Header Block type begins a pcapng file")
+
+    test.case("and one of the four classic numbers is pcap")
+    match pcaphdr.format_of(micro_magic_bytes())
+        Ok(f)  => test.assert(pcaphdr.format_name(f) == "pcap")
+        Err(_) => test.fail("A1 B2 C3 D4 begins a classic file")
+
+@test
+fn test_a_classic_header_is_24_octets_and_version_2_4() [io]
+    test.case("the constructor fills in the version nobody sets by hand")
+    let h = pcaphdr.file_header(PcapMagicMicrosecondSwapped, 262144,
+                                PcapLinkEthernet)
+    test.assert(h.version_major == 2)
+    test.assert(h.version_minor == 4)
+    test.assert(h.this_zone == 0)
+    test.assert(h.sig_figs == 0)
+
+    test.case("the file's order and resolution are the header's magic")
+    test.assert(pcapbyte.order_name(pcaphdr.header_order(h)) == "little-endian")
+    test.assert(pcapts.ticks_per_second(pcaphdr.header_resolution(h)) == 1000000)
+
+    test.case("and 24 zero octets are not a header")
+    match pcaphdr.parse_file_header(list.zeros(24))
+        Ok(_)  => test.fail("zero is not one of the four magic numbers")
+        Err(e) => test.assert(pcaperror.code(e) == "bad_magic")
+
+@test
+fn test_a_writer_cannot_ask_for_a_fifth_magic_number() [io]
+    // The classic format has four magic numbers, and a capture at
+    // 2^-16 seconds cannot be written as one of them.  Refusing is
+    // what makes the caller choose what to lose; the alternative is a
+    // file whose timestamps are wrong by a factor nothing records.
+    test.case("microseconds and nanoseconds are writable")
+    match pcaphdr.magic_for(PcapLittleEndian, pcapts.nanos())
+        Ok(m)  => test.assert(pcaphdr.magic_word(m) == 1295823521)
+        Err(_) => test.fail("4D 3C B2 A1 is a magic number")
+
+    test.case("and a binary resolution is not")
+    match pcaphdr.magic_for(PcapBigEndian, PcapBinaryResolution(16))
+        Ok(_)  => test.fail("the classic format cannot express 2^-16 seconds")
+        Err(e) => test.assert(pcaperror.is_caller_fault(e))
+
+@test
+fn test_a_packet_says_what_it_does_not_know() [io]
+    test.case("a truncated packet says so, and volume comes from the other field")
+    let cut = pcaphdr.packet(0, pcapts.timestamp(0), 96, 1514, 40,
+                             PcapFromClassicRecord)
+    test.assert(pcaphdr.is_truncated(cut))
+    test.assert(cut.original_length == 1514)
+    test.assert(cut.captured_length == 96)
+
+    test.case("a Simple Packet Block carries NO timestamp, and the zero is not 1970")
+    let simple = pcaphdr.packet(0, pcapts.timestamp(0), 60, 60, 24,
+                                PcapFromSimpleBlock)
+    test.assert(not pcaphdr.has_timestamp(simple))
+
+    test.case("and its captured length is derived, not stated")
+    test.assert(not pcaphdr.length_is_exact(PcapFromSimpleBlock))
+    test.assert(pcaphdr.length_is_exact(PcapFromEnhancedBlock))
+    test.assert(pcaphdr.length_is_exact(PcapFromClassicRecord))
+
+    test.case("an Enhanced Packet Block carries one")
+    let epb = pcaphdr.packet(1, pcapts.timestamp(17), 60, 60, 128,
+                             PcapFromEnhancedBlock)
+    test.assert(pcaphdr.has_timestamp(epb))
+    test.assert(epb.interface_id == 1)
+    test.assert(epb.payload_at == 128)
+
+@test
+fn test_a_span_points_into_the_chunk_and_into_the_stream() [io]
+    test.case("both coordinates, because a caller needs both")
+    let s = pcaphdr.span(16, 1514, 40)
+    test.assert(s.chunk_at == 16)
+    test.assert(s.length == 1514)
+    test.assert(s.stream_at == 40)
+
+    test.case("and the end is in the chunk's coordinates, where a slice is taken")
+    test.assert(pcaphdr.span_end(s) == 1530)
+
+@test
+fn test_the_link_type_is_the_only_thing_that_says_what_a_packet_is() [io]
+    test.case("the six named types are the registry's numbers")
+    test.assert(pcaplink.link_code(PcapLinkNull) == 0)
+    test.assert(pcaplink.link_code(PcapLinkEthernet) == 1)
+    test.assert(pcaplink.link_code(PcapLinkRaw) == 101)
+    test.assert(pcaplink.link_code(PcapLinkIeee80211) == 105)
+    test.assert(pcaplink.link_code(PcapLinkLinuxSll) == 113)
+    test.assert(pcaplink.link_code(PcapLinkLinuxSll2) == 276)
+
+    test.case("a number the registry has and this package does not is not an error")
+    test.assert(not pcaplink.is_named(pcaplink.link_type(147)))
+    test.assert(pcaplink.is_named(pcaplink.link_type(113)))
+    test.assert(pcaplink.link_name(pcaplink.link_type(147)) == "LINKTYPE_147")
+    test.assert(pcaplink.link_name(PcapLinkLinuxSll) == "LINKTYPE_LINUX_SLL")
+
+    test.case("a fixed link header length is known for four of them")
+    match pcaplink.fixed_header_length(PcapLinkEthernet)
+        Some(n) => test.assert(n == 14)
+        None    => test.fail("an Ethernet header is fourteen octets")
+    match pcaplink.fixed_header_length(PcapLinkLinuxSll)
+        Some(n) => test.assert(n == 16)
+        None    => test.fail("a Linux cooked header is sixteen octets")
+    match pcaplink.fixed_header_length(PcapLinkRaw)
+        Some(n) => test.assert(n == 0)
+        None    => test.fail("LINKTYPE_RAW has no link header at all")
+
+    test.case("and an 802.11 header's length is in the header")
+    match pcaplink.fixed_header_length(PcapLinkIeee80211)
+        Some(_) => test.fail("an 802.11 header is ten to thirty octets")
+        None    => test.assert(true)
+
+@test
+fn test_the_loopback_family_is_in_the_files_order_not_network_order() [io]
+    // The quiet one.  LINKTYPE_NULL's four leading octets are an
+    // address family written by the capturing machine in that
+    // machine's byte order, which is the file's.  A reader that read
+    // them big-endian like every other protocol field sees family
+    // 33554432 rather than 2 and calls every loopback capture
+    // unknown.
+    test.case("LINKTYPE_NULL is the exception")
+    test.assert(pcaplink.family_is_in_file_order(PcapLinkNull))
+
+    test.case("and nothing else is: a protocol field is network order")
+    test.assert(not pcaplink.family_is_in_file_order(PcapLinkEthernet))
+    test.assert(not pcaplink.family_is_in_file_order(PcapLinkRaw))

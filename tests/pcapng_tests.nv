@@ -1,0 +1,267 @@
+// tests/pcapng_tests.nv — the block frame, the section, the interface
+// table, and the option code that means four different things.
+//
+// They COMPILE today and they FAIL at run with `not implemented`.
+// The block types and option codes are from the pcapng
+// specification, sections 4.1 to 4.6 and section 3.5.
+
+use std.test
+use pcapbyte
+use pcaperror
+use pcaplink
+use pcapngblock
+use pcapngopt
+use pcapts
+
+@test
+fn test_the_block_types_are_the_specifications_numbers() [io]
+    test.case("the Section Header Block type is a palindrome on purpose")
+    // 0x0A0D0D0A reads the same whichever way round the section turns
+    // out to be, which is what lets a reader find the Byte-Order
+    // Magic before it knows the byte order.
+    test.assert(pcapngblock.block_code(PcapngSectionHeader) == 168627466)
+
+    test.case("and the rest are small numbers")
+    test.assert(pcapngblock.block_code(PcapngInterfaceDescription) == 1)
+    test.assert(pcapngblock.block_code(PcapngObsoletePacket) == 2)
+    test.assert(pcapngblock.block_code(PcapngSimplePacket) == 3)
+    test.assert(pcapngblock.block_code(PcapngNameResolution) == 4)
+    test.assert(pcapngblock.block_code(PcapngInterfaceStatistics) == 5)
+    test.assert(pcapngblock.block_code(PcapngEnhancedPacket) == 6)
+
+    test.case("a Custom Block's type says whether a rewriter may copy it")
+    test.assert(pcapngblock.block_code(PcapngCustom(true)) == 2989)
+    test.assert(pcapngblock.block_code(PcapngCustom(false)) == 1073744813)
+
+    test.case("and a type this package has never seen is still a block")
+    test.assert(not pcapngblock.is_decoded(pcapngblock.block_type(2147483647)))
+    test.assert(pcapngblock.block_name(PcapngEnhancedPacket) == "EPB")
+
+@test
+fn test_a_packet_block_is_streamed_and_everything_else_is_buffered() [io]
+    test.case("the three blocks that carry packet octets")
+    test.assert(pcapngblock.carries_packet(PcapngEnhancedPacket))
+    test.assert(pcapngblock.carries_packet(PcapngSimplePacket))
+    test.assert(pcapngblock.carries_packet(PcapngObsoletePacket))
+
+    test.case("and the ones that do not")
+    test.assert(not pcapngblock.carries_packet(PcapngNameResolution))
+    test.assert(not pcapngblock.carries_packet(PcapngInterfaceStatistics))
+
+    test.case("the obsolete Packet Block is named but not decoded")
+    // A reader that skipped it silently would leave a rewriter with
+    // no way to know what it dropped.
+    test.assert(not pcapngblock.is_decoded(PcapngObsoletePacket))
+    test.assert(pcapngblock.is_decoded(PcapngEnhancedPacket))
+
+    test.case("and a block's framing says where it was and how long")
+    let b = pcapngblock.block(PcapngObsoletePacket, 64, 1024)
+    test.assert(b.total_length == 64)
+    test.assert(b.at == 1024)
+
+@test
+fn test_a_section_length_of_minus_one_is_unknown_and_not_a_number() [io]
+    // A capture still being written cannot know its own length, and
+    // so writes -1.  A reader that took the field as a number stops
+    // at the first packet of every live capture.
+    test.case("None is the common case")
+    let live = pcapngblock.section(PcapLittleEndian, 1, 0, None, [], 0)
+    match pcapngblock.section_length(live)
+        Some(_) => test.fail("a writer still writing does not know")
+        None    => test.assert(true)
+
+    test.case("and a finished file may say")
+    let done = pcapngblock.section(PcapBigEndian, 1, 0, Some(4096), [], 0)
+    match pcapngblock.section_length(done)
+        Some(n) => test.assert(n == 4096)
+        None    => test.fail("this section header stated its length")
+
+    test.case("the section carries its own byte order, and the next may differ")
+    test.assert(pcapbyte.order_name(live.order) == "little-endian")
+    test.assert(pcapbyte.order_name(done.order) == "big-endian")
+
+@test
+fn test_a_section_header_establishes_the_order_before_anything_reads_a_field() [io]
+    test.case("a body whose Byte-Order Magic is neither way round is refused")
+    match pcapngblock.parse_section(list.zeros(16), 0)
+        Ok(_)  => test.fail("zero is not 0x1A2B3C4D either way round")
+        Err(e) => test.assert(pcaperror.code(e) == "bad_byte_order_magic")
+
+@test
+fn test_an_interface_takes_the_specifications_defaults() [io]
+    // The defaults are applied once, here, because microseconds and
+    // an offset of zero are what an absent option MEANS — and a
+    // caller that guessed differently would misdate a whole capture.
+    test.case("no options is microseconds, no offset, no names")
+    let i = pcapngblock.interface(0, PcapLinkEthernet, 262144, [])
+    test.assert(pcapts.ticks_per_second(i.resolution) == 1000000)
+    test.assert(i.offset_seconds == 0)
+    test.assert(i.name == "")
+    test.assert(i.description == "")
+    test.assert(pcaplink.link_code(i.link_type) == 1)
+
+    test.case("and an absent if_fcslen is None, which is not zero")
+    // None means the capture did not state whether the four trailing
+    // octets of an Ethernet frame are the FCS or the payload.
+    match i.fcs_length
+        Some(_) => test.fail("no if_fcslen option was given")
+        None    => test.assert(true)
+
+    test.case("a body of zeros is a legal interface description")
+    match pcapngblock.parse_interface(list.zeros(8), PcapLittleEndian, 0, 64, 0)
+        Ok(p)  => test.assert(p.snap_length == 0)
+        Err(_) => test.fail("link type 0 and snapshot length 0 are both legal")
+
+@test
+fn test_the_same_option_code_means_four_different_things() [io]
+    // Code 2 is shb_hardware, if_name, epb_flags and isb_starttime.
+    // Reading an Enhanced Packet Block's four-octet flags word as an
+    // interface name gives a short string of control characters, and
+    // no reader complains — which is why the lookup takes the block.
+    test.case("code 2 in an Interface Description Block is if_name")
+    match pcapngopt.option_name(PcapngInterfaceDescription, 2)
+        PcapngIfName => test.assert(true)
+        _            => test.fail("code 2 in an IDB is if_name")
+
+    test.case("code 2 in an Enhanced Packet Block is epb_flags")
+    match pcapngopt.option_name(PcapngEnhancedPacket, 2)
+        PcapngEpbFlags => test.assert(true)
+        _              => test.fail("code 2 in an EPB is epb_flags")
+
+    test.case("code 2 in a Section Header Block is shb_hardware")
+    match pcapngopt.option_name(PcapngSectionHeader, 2)
+        PcapngShbHardware => test.assert(true)
+        _                 => test.fail("code 2 in an SHB is shb_hardware")
+
+    test.case("and code 1 is opt_comment in every one of them")
+    match pcapngopt.option_name(PcapngInterfaceStatistics, 1)
+        PcapngOptComment => test.assert(true)
+        _                => test.fail("code 1 is opt_comment everywhere")
+
+    test.case("the codes come back out")
+    test.assert(pcapngopt.option_code(PcapngIfTsResol) == 9)
+    test.assert(pcapngopt.option_code(PcapngIfTsOffset) == 14)
+    test.assert(pcapngopt.option_code(PcapngIsbIfDrop) == 5)
+    test.assert(pcapngopt.option_code(PcapngOptEndOfOpt) == 0)
+    test.assert(pcapngopt.option_label(PcapngIfTsOffset) == "if_tsoffset")
+
+@test
+fn test_a_lookup_that_is_given_the_wrong_block_answers_nothing() [io]
+    test.case("an interface's options do not answer an EPB question")
+    let opts = [pcapngopt.option(2, list.zeros(4))]
+    match pcapngopt.named(opts, PcapngInterfaceDescription, PcapngEpbFlags)
+        Some(_) => test.fail("epb_flags is not an interface option")
+        None    => test.assert(true)
+
+    test.case("and the same list answers the right one")
+    match pcapngopt.named(opts, PcapngInterfaceDescription, PcapngIfName)
+        Some(o) => test.assert(list.len(o.value) == 4)
+        None    => test.fail("code 2 in an IDB is if_name")
+
+    test.case("opt_comment is the one option that may repeat")
+    let comments = [pcapngopt.comment("first"), pcapngopt.comment("second")]
+    test.assert(list.len(pcapngopt.all(comments, PcapngSectionHeader,
+                                       PcapngOptComment)) == 2)
+    test.assert(pcapngopt.text_of(pcapngopt.comment("edge router")) == "edge router")
+
+@test
+fn test_an_option_value_is_read_as_the_shape_the_specification_gives_it() [io]
+    test.case("a one-octet option is one octet, and four is not one")
+    match pcapngopt.octet_of(pcapngopt.option(9, list.zeros(1)))
+        Some(v) => test.assert(v == 0)
+        None    => test.fail("if_tsresol is one octet")
+    match pcapngopt.octet_of(pcapngopt.option(9, list.zeros(4)))
+        Some(_) => test.fail("four octets are not an if_tsresol")
+        None    => test.assert(true)
+
+    test.case("a four-octet option is read in the SECTION's byte order")
+    match pcapngopt.u32_of(pcapngopt.option(2, list.zeros(4)), PcapLittleEndian)
+        Some(v) => test.assert(v == 0)
+        None    => test.fail("epb_flags is four octets")
+
+    test.case("and an eight-octet one likewise")
+    match pcapngopt.u64_of(pcapngopt.option(8, list.zeros(8)), PcapBigEndian)
+        Some(v) => test.assert(v == 0)
+        None    => test.fail("if_speed is eight octets")
+    match pcapngopt.u64_of(pcapngopt.option(8, list.zeros(4)), PcapBigEndian)
+        Some(_) => test.fail("four octets are not an if_speed")
+        None    => test.assert(true)
+
+@test
+fn test_the_length_field_counts_the_value_and_the_block_counts_the_padding() [io]
+    // The alignment bug appears at the first option whose value is
+    // not a multiple of four — which is most of them, because
+    // if_tsresol is one octet.
+    test.case("a one-octet option occupies eight")
+    test.assert(pcapngopt.padded_length(pcapngopt.option(9, list.zeros(1))) == 8)
+
+    test.case("a four-octet one occupies eight too, with no padding")
+    test.assert(pcapngopt.padded_length(pcapngopt.option(2, list.zeros(4))) == 8)
+
+    test.case("and the padding rule serves both formats' payloads as well")
+    test.assert(pcapngopt.padding_for(1) == 3)
+    test.assert(pcapngopt.padding_for(2) == 2)
+    test.assert(pcapngopt.padding_for(3) == 1)
+    test.assert(pcapngopt.padding_for(4) == 0)
+
+    test.case("the end marker has no value")
+    test.assert(list.len(pcapngopt.end_of_options().value) == 0)
+
+    test.case("and an empty options area parses to nothing")
+    match pcapngopt.parse_options(list.zeros(4), PcapLittleEndian, 64, 0)
+        Ok(opts) => test.assert(list.len(opts) == 0)
+        Err(_)   => test.fail("four zero octets are an opt_endofopt")
+
+@test
+fn test_a_name_record_keeps_the_address_as_the_octets_the_block_wrote() [io]
+    // Octets rather than a parsed address, so that this package
+    // declares no address type for anybody to collide with.  A caller
+    // that wants them parsed hands them to an address package.
+    test.case("an IPv4 record is four octets and an IPv6 one is sixteen")
+    let v4 = pcapngblock.name_record(1, list.zeros(4), ["gateway"])
+    let v6 = pcapngblock.name_record(2, list.zeros(16), ["ada.example", "www"])
+    test.assert(list.len(v4.address) == 4)
+    test.assert(list.len(v6.address) == 16)
+
+    test.case("a record may carry several names, and the NUL separators are gone")
+    test.assert(list.len(v6.names) == 2)
+    test.assert(v4.record_type == 1)
+
+    test.case("an empty block is a block with no records")
+    let n = pcapngblock.name_resolution([v4], [])
+    test.assert(list.len(n.records) == 1)
+    match pcapngblock.parse_name_resolution(list.zeros(4), PcapLittleEndian, 64, 0)
+        Ok(parsed) => test.assert(list.len(parsed.records) == 0)
+        Err(_)     => test.fail("a record of type 0 ends the list")
+
+@test
+fn test_the_drop_count_is_the_number_that_decides_what_a_capture_proves() [io]
+    // A capture that dropped packets is missing traffic that was
+    // there, and every conclusion drawn from it about what did NOT
+    // happen is wrong.  Most tools never show it.
+    test.case("a statistics block with no options states no counts")
+    let s = pcapngblock.statistics(0, pcapts.timestamp(0), [])
+    match pcapngblock.packets_dropped(s, PcapLittleEndian)
+        Some(_) => test.fail("no isb_ifdrop option was given")
+        None    => test.assert(true)
+    match pcapngblock.packets_received(s, PcapLittleEndian)
+        Some(_) => test.fail("no isb_ifrecv option was given")
+        None    => test.assert(true)
+
+    test.case("and the block names the interface of its own section")
+    test.assert(pcapngblock.statistics(1, pcapts.timestamp(0), []).interface_id == 1)
+    match pcapngblock.parse_statistics(list.zeros(12), PcapLittleEndian, 64, 0)
+        Ok(p)  => test.assert(p.interface_id == 0)
+        Err(_) => test.fail("twelve zero octets are a statistics block body")
+
+@test
+fn test_a_custom_block_says_who_defined_it_and_whether_it_may_be_copied() [io]
+    test.case("the enterprise number is the only thing that says what the data is")
+    let c = pcapngblock.custom(32473, true, 16, 1024)
+    test.assert(c.enterprise == 32473)
+    test.assert(c.copiable)
+    test.assert(c.data_length == 16)
+    test.assert(c.data_at == 1024)
+
+    test.case("and the other block type is content a rewriter must not carry over")
+    test.assert(not pcapngblock.custom(32473, false, 0, 0).copiable)

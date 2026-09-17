@@ -1,0 +1,240 @@
+// pcapbyte.nv — which way round a file's integers lie, and the reads
+// and writes that take that as an argument.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// BYTE ORDER IS A VALUE, NEVER AN ASSUMPTION
+//
+// Both capture formats are written in the byte order of whichever
+// machine wrote them, and both say which one that was: a classic pcap
+// file says it in its magic number, and a pcapng section says it in
+// its Byte-Order Magic.  A reader that used its own machine's order
+// reads every field of a foreign file backwards — a snapshot length
+// of 262144 arrives as 4096 and one of 65535 arrives as 4294901760,
+// and neither is obviously wrong until the third packet.
+//
+// So there is no host order in this package, no function that swaps
+// only when it has to, and no field anywhere that means "the same way
+// round as this program".  Every integer read and every integer
+// written takes a `PcapByteOrder`, which came from the file.
+//
+// THE READS ANSWER AN `Int`
+//
+// A `u32` read out of a file is an unsigned value up to 4294967295,
+// and a signed 64-bit `Int` holds every one of them.  The reads
+// therefore never answer a negative number, and the writes refuse a
+// value the field cannot hold rather than truncating it, because a
+// truncated length field is a corrupt file that no reader will
+// report.
+
+// Which way round a file's multi-octet integers lie.
+//
+// ```novo
+// use pcapbyte
+//
+// fn main() [io]
+//     println(pcapbyte.order_name(PcapBigEndian))     // big-endian
+// ```
+pub enum PcapByteOrder
+    // Most significant octet first, which is how the four octets of a
+    // classic magic number spell 0xA1B2C3D4 and how pcapng's
+    // Byte-Order Magic spells 0x1A2B3C4D.
+    PcapBigEndian
+    // Least significant octet first, which is what every capture
+    // written on a common desktop or server is.
+    PcapLittleEndian
+
+// The order's name, for a log: `"big-endian"` or `"little-endian"`.
+//
+// ```novo
+// use pcapbyte
+//
+// fn main() [io]
+//     println(pcapbyte.order_name(PcapLittleEndian))  // little-endian
+// ```
+pub fn order_name(o: PcapByteOrder) -> Str
+    todo("pcapfile-nv.pcapbyte.order_name")
+
+// The other order.
+//
+// A file is read in one order throughout, so this is not for reading
+// fields.  It is for the two places a reader has to try both: sensing
+// a classic magic number, and sensing a pcapng section's Byte-Order
+// Magic.
+//
+// ```novo
+// use pcapbyte
+//
+// fn main() [io]
+//     println(pcapbyte.order_name(pcapbyte.opposite(PcapBigEndian)))
+// ```
+pub fn opposite(o: PcapByteOrder) -> PcapByteOrder
+    todo("pcapfile-nv.pcapbyte.opposite")
+
+// Two octets of `bytes` at `at`, as an unsigned value from 0 to 65535.
+//
+// `None` when fewer than two octets remain, which is how a caller
+// walking a block's options tells "the option header is there" from
+// "the block ended".
+//
+// ```novo
+// use pcapbyte
+//
+// fn main() [io]
+//     let b = [0x12 as u8, 0x34 as u8]
+//     match pcapbyte.read_u16(b, 0, PcapBigEndian)
+//         Some(v) => println("${v}")               // 4660
+//         None    => println("not two octets")
+// ```
+pub fn read_u16(bytes: [u8], at: Int, o: PcapByteOrder) -> ?Int
+    todo("pcapfile-nv.pcapbyte.read_u16")
+
+// Four octets of `bytes` at `at`, as an unsigned value from 0 to
+// 4294967295.
+//
+// Never negative: every length, every timestamp half and every block
+// type in both formats is an unsigned 32-bit field, and a reader that
+// sign-extended one would answer a negative capture length for any
+// file over two gibibytes.
+//
+// ```novo
+// use pcapbyte
+//
+// fn main() [io]
+//     let b = [0xFF as u8, 0xFF as u8, 0xFF as u8, 0xFF as u8]
+//     match pcapbyte.read_u32(b, 0, PcapLittleEndian)
+//         Some(v) => println("${v}")               // 4294967295
+//         None    => println("not four octets")
+// ```
+pub fn read_u32(bytes: [u8], at: Int, o: PcapByteOrder) -> ?Int
+    todo("pcapfile-nv.pcapbyte.read_u32")
+
+// Four octets of `bytes` at `at`, as a SIGNED value from -2147483648
+// to 2147483647.
+//
+// Two fields in the formats are signed and both are easy to miss: the
+// classic file header's `thiszone`, a correction in seconds from the
+// capture's timestamps to UTC, and the `if_tzone` option.  A reader
+// that read them unsigned turns a capture made west of Greenwich into
+// one made in the year 2106.
+//
+// ```novo
+// use pcapbyte
+//
+// fn main() [io]
+//     let b = [0xFF as u8, 0xFF as u8, 0xFF as u8, 0xFF as u8]
+//     match pcapbyte.read_i32(b, 0, PcapBigEndian)
+//         Some(v) => println("${v}")               // -1
+//         None    => println("not four octets")
+// ```
+pub fn read_i32(bytes: [u8], at: Int, o: PcapByteOrder) -> ?Int
+    todo("pcapfile-nv.pcapbyte.read_i32")
+
+// Eight octets of `bytes` at `at`, as an unsigned value.
+//
+// `None` when fewer than eight octets remain, and `None` as well when
+// the value is above 9223372036854775807, which a signed `Int` cannot
+// hold.  That case is not hypothetical: a Section Header Block whose
+// section length is unknown writes 0xFFFFFFFFFFFFFFFF, and
+// `pcapngblock.section_length` is what reads it as "unknown" rather
+// than as a number.
+//
+// ```novo
+// use pcapbyte
+//
+// fn main() [io]
+//     let b = [0 as u8, 0 as u8, 0 as u8, 0 as u8,
+//              0 as u8, 0 as u8, 0 as u8, 1 as u8]
+//     match pcapbyte.read_u64(b, 0, PcapBigEndian)
+//         Some(v) => println("${v}")               // 1
+//         None    => println("not eight octets, or too large for an Int")
+// ```
+pub fn read_u64(bytes: [u8], at: Int, o: PcapByteOrder) -> ?Int
+    todo("pcapfile-nv.pcapbyte.read_u64")
+
+// Eight octets of `bytes` at `at`, as a signed value.
+//
+// The Section Header Block's section length is a signed 64-bit field
+// whose -1 means "the writer did not know", and the `isb_starttime`
+// and `isb_endtime` options are 64-bit counts.  This is the read for
+// the first; `pcapngblock.section_length` puts the -1 rule on top of
+// it.
+//
+// ```novo
+// use pcapbyte
+//
+// fn main() [io]
+//     let b = [0xFF as u8, 0xFF as u8, 0xFF as u8, 0xFF as u8,
+//              0xFF as u8, 0xFF as u8, 0xFF as u8, 0xFF as u8]
+//     match pcapbyte.read_i64(b, 0, PcapLittleEndian)
+//         Some(v) => println("${v}")               // -1
+//         None    => println("not eight octets")
+// ```
+pub fn read_i64(bytes: [u8], at: Int, o: PcapByteOrder) -> ?Int
+    todo("pcapfile-nv.pcapbyte.read_i64")
+
+// `v` as two octets in `o`.
+//
+// `PcapUnwritable` when `v` is below 0 or above 65535.  Refused
+// rather than masked: a truncated option length produces a file every
+// reader walks differently, and the writer is the last place that can
+// still say so.
+//
+// ```novo
+// use pcapbyte
+//
+// fn main() [io]
+//     match pcapbyte.write_u16(4660, PcapBigEndian)
+//         Ok(b)  => println("${list.len(b)}")      // 2
+//         Err(e) => println(e.message())
+// ```
+pub fn write_u16(v: Int, o: PcapByteOrder) -> Result<[u8], PcapError>
+    todo("pcapfile-nv.pcapbyte.write_u16")
+
+// `v` as four octets in `o`.
+//
+// `PcapUnwritable` when `v` is below 0 or above 4294967295.
+//
+// ```novo
+// use pcapbyte
+//
+// fn main() [io]
+//     match pcapbyte.write_u32(4294967295, PcapLittleEndian)
+//         Ok(b)  => println("${list.len(b)}")      // 4
+//         Err(e) => println(e.message())
+// ```
+pub fn write_u32(v: Int, o: PcapByteOrder) -> Result<[u8], PcapError>
+    todo("pcapfile-nv.pcapbyte.write_u32")
+
+// `v` as four octets in `o`, signed.
+//
+// `PcapUnwritable` outside -2147483648 to 2147483647.  For the
+// classic header's `thiszone`, which is the one signed field a writer
+// of this format ever sets.
+//
+// ```novo
+// use pcapbyte
+//
+// fn main() [io]
+//     match pcapbyte.write_i32(0 - 3600, PcapBigEndian)
+//         Ok(b)  => println("${list.len(b)}")      // 4
+//         Err(e) => println(e.message())
+// ```
+pub fn write_i32(v: Int, o: PcapByteOrder) -> Result<[u8], PcapError>
+    todo("pcapfile-nv.pcapbyte.write_i32")
+
+// `v` as eight octets in `o`, signed.
+//
+// Every 64-bit field in pcapng is written through this, including the
+// -1 that means an unknown section length.
+//
+// ```novo
+// use pcapbyte
+//
+// fn main() [io]
+//     match pcapbyte.write_i64(0 - 1, PcapLittleEndian)
+//         Ok(b)  => println("${list.len(b)}")      // 8
+//         Err(e) => println(e.message())
+// ```
+pub fn write_i64(v: Int, o: PcapByteOrder) -> Result<[u8], PcapError>
+    todo("pcapfile-nv.pcapbyte.write_i64")

@@ -1,0 +1,390 @@
+// pcapts.nv — a packet's timestamp, which is a count of ticks and not
+// a time.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A TIMESTAMP IS AN INTEGER IN A RESOLUTION IT DOES NOT CARRY
+//
+// Neither format stores a time.  Both store a count, and the size of
+// one tick is written somewhere else: in the classic magic number,
+// which says microseconds or nanoseconds, and in a pcapng interface's
+// `if_tsresol` option, which says any power of ten or of two.  A
+// count without its resolution is meaningless, and a reader that
+// assumed microseconds turns a nanosecond capture into one a thousand
+// times longer than it was — with every packet still in order, still
+// monotonic, and still plausible.
+//
+// That is why `PcapTimestamp` holds a count and nothing else, and why
+// every conversion out of one takes the resolution as an argument.  A
+// caller gets the resolution from the interface the packet came from,
+// which `pcapread.resolution` answers.
+//
+// THERE IS NO CLOCK HERE
+//
+// This package cannot read the time, and that is deliberate beyond
+// the layer rule.  A capture file is a record of when packets were
+// seen by whoever saw them; a writer that stamped `now` would be
+// recording when the file was assembled, which is a different and
+// usually wrong number.  So `pcapwrite` takes every timestamp as an
+// argument, and a program that rewrites a capture carries the
+// original instants through untouched.
+//
+// THE OFFSET IS PART OF THE ANSWER
+//
+// A pcapng interface may carry an `if_tsoffset`, a number of seconds
+// added to every timestamp on that interface, whose default is zero.
+// It exists so that a capture of a long run can use a small counter.
+// A reader that ignored it is wrong by whatever the writer chose, and
+// the writers that use it choose large numbers.  So the conversions
+// take it, and the `_at_offset` spelling is what makes forgetting it
+// visible.
+
+// How big one tick of a timestamp is.
+//
+// ```novo
+// use pcapts
+//
+// fn main() [io]
+//     println("${pcapts.ticks_per_second(pcapts.micros())}")   // 1000000
+// ```
+pub enum PcapResolution
+    // One tick is 10^-exponent seconds.  Six is microseconds, nine is
+    // nanoseconds, and those two are the only values a classic pcap
+    // file can express.  pcapng writes this form when `if_tsresol`
+    // has its top bit clear.
+    PcapDecimalResolution(exponent: Int)
+    // One tick is 2^-exponent seconds.  pcapng writes this form when
+    // `if_tsresol` has its top bit set.  It is rare, it is legal, and
+    // a reader that treated the octet as a decimal exponent
+    // regardless reads a capture at 2^-16 seconds as one at 10^-16,
+    // which is off by ten orders of magnitude.
+    PcapBinaryResolution(exponent: Int)
+
+// A packet's timestamp, as a count of ticks since the Unix epoch.
+//
+// The tick size is not in here.  It belongs to the interface the
+// packet was captured on, and every conversion below takes it.
+//
+// ```novo
+// use pcapts
+//
+// fn main() [io]
+//     println("${pcapts.ticks(pcapts.timestamp(1700000000000000))}")
+// ```
+pub struct PcapTimestamp
+    // The count.  Read it with `pcapts.ticks`; the field is here so
+    // the type is reviewable.
+    count: Int
+
+// An instant as whole seconds since the Unix epoch and a count of
+// nanoseconds inside that second.
+//
+// The shape every other library and every operating system takes, so
+// that handing a packet's instant to something else is one
+// conversion and not a decision.
+//
+// ```novo
+// use pcapts
+//
+// fn main() [io]
+//     let u = pcapts.unix_time(1700000000, 500000000)
+//     println("${u.seconds}.${u.nanoseconds}")
+// ```
+pub struct PcapUnixTime
+    // Whole seconds since 1970-01-01 00:00:00 UTC.  Negative for an
+    // instant before it, which a capture with a badly set clock has.
+    seconds: Int
+    // Nanoseconds inside that second, from 0 to 999999999.  Never
+    // negative, including when `seconds` is.
+    nanoseconds: Int
+
+// Microsecond resolution: `PcapDecimalResolution(6)`.
+//
+// What a classic pcap file with the 0xA1B2C3D4 magic is in, and what
+// a pcapng interface with no `if_tsresol` option is in.
+//
+// ```novo
+// use pcapts
+//
+// fn main() [io]
+//     println("${pcapts.ticks_per_second(pcapts.micros())}")   // 1000000
+// ```
+pub fn micros() -> PcapResolution
+    todo("pcapfile-nv.pcapts.micros")
+
+// Nanosecond resolution: `PcapDecimalResolution(9)`.
+//
+// What a classic pcap file with the 0xA1B23C4D magic is in.  The two
+// magic numbers differ in one nibble and nothing else in the file
+// changes, which is why a reader that matched only the first one
+// silently reads these captures as if a second lasted a thousand
+// seconds.
+//
+// ```novo
+// use pcapts
+//
+// fn main() [io]
+//     println("${pcapts.ticks_per_second(pcapts.nanos())}")    // 1000000000
+// ```
+pub fn nanos() -> PcapResolution
+    todo("pcapfile-nv.pcapts.nanos")
+
+// The resolution a pcapng `if_tsresol` octet describes.
+//
+// The octet's top bit picks the base: clear means the remaining seven
+// bits are a power of ten, set means they are a power of two
+// (pcapng section 4.2, option code 9).
+//
+// `PcapBadResolution` for an exponent a 64-bit tick count cannot
+// address: above eighteen in the decimal form and above sixty-three
+// in the binary one.  Refused rather than clamped, because a clamped
+// resolution gives wrong instants instead of no instants.
+//
+// ```novo
+// use pcapts
+//
+// fn main() [io]
+//     match pcapts.resolution_of_tsresol(9)
+//         Ok(r)  => println("${pcapts.ticks_per_second(r)}")   // 1000000000
+//         Err(e) => println(e.message())
+// ```
+pub fn resolution_of_tsresol(octet: Int) -> Result<PcapResolution, PcapError>
+    todo("pcapfile-nv.pcapts.resolution_of_tsresol")
+
+// The `if_tsresol` octet a resolution is written as.
+//
+// `PcapUnwritable` for an exponent that does not fit the seven bits
+// the octet leaves: above 127 either way.
+//
+// ```novo
+// use pcapts
+//
+// fn main() [io]
+//     match pcapts.tsresol_octet(pcapts.micros())
+//         Ok(b)  => println("${b}")                  // 6
+//         Err(e) => println(e.message())
+// ```
+pub fn tsresol_octet(r: PcapResolution) -> Result<Int, PcapError>
+    todo("pcapfile-nv.pcapts.tsresol_octet")
+
+// How many ticks make one second at this resolution.
+//
+// 1000000 for microseconds, 1000000000 for nanoseconds, 65536 for
+// `PcapBinaryResolution(16)`.  It is the number a caller comparing
+// two timestamps on the same interface needs, and the only number it
+// needs.
+//
+// ```novo
+// use pcapts
+//
+// fn main() [io]
+//     println("${pcapts.ticks_per_second(PcapBinaryResolution(16))}")   // 65536
+// ```
+pub fn ticks_per_second(r: PcapResolution) -> Int
+    todo("pcapfile-nv.pcapts.ticks_per_second")
+
+// Whether this resolution is finer than one nanosecond.
+//
+// True for a decimal exponent above nine and for a binary exponent
+// above thirty.  Both are legal in pcapng and neither survives a
+// conversion to seconds and nanoseconds, so a program that must not
+// lose precision asks this before it converts and keeps the tick
+// count instead.
+//
+// ```novo
+// use pcapts
+//
+// fn main() [io]
+//     println("${pcapts.is_finer_than_nanosecond(PcapDecimalResolution(12))}")  // true
+//     println("${pcapts.is_finer_than_nanosecond(pcapts.nanos())}")             // false
+// ```
+pub fn is_finer_than_nanosecond(r: PcapResolution) -> Bool
+    todo("pcapfile-nv.pcapts.is_finer_than_nanosecond")
+
+// A timestamp from a tick count.
+//
+// ```novo
+// use pcapts
+//
+// fn main() [io]
+//     println("${pcapts.ticks(pcapts.timestamp(42))}")     // 42
+// ```
+pub fn timestamp(count: Int) -> PcapTimestamp
+    todo("pcapfile-nv.pcapts.timestamp")
+
+// The tick count a timestamp holds.
+//
+// ```novo
+// use pcapts
+//
+// fn main() [io]
+//     println("${pcapts.ticks(pcapts.timestamp(42))}")     // 42
+// ```
+pub fn ticks(t: PcapTimestamp) -> Int
+    todo("pcapfile-nv.pcapts.ticks")
+
+// A timestamp from the two 32-bit halves an Enhanced Packet Block
+// writes.
+//
+// pcapng splits its 64-bit tick count into a high word and a low word
+// so that the format needs no 64-bit field (section 4.3).  The two
+// are read as unsigned 32-bit values in the section's byte order —
+// and then combined the same way whichever order that was, which is
+// the mistake this function exists to make unwritable: the halves do
+// not swap with the section.
+//
+// ```novo
+// use pcapts
+//
+// fn main() [io]
+//     println("${pcapts.ticks(pcapts.from_halves(1, 0))}")   // 4294967296
+// ```
+pub fn from_halves(high: Int, low: Int) -> PcapTimestamp
+    todo("pcapfile-nv.pcapts.from_halves")
+
+// The high 32 bits of a tick count, for a writer.
+//
+// ```novo
+// use pcapts
+//
+// fn main() [io]
+//     println("${pcapts.high_half(pcapts.timestamp(4294967296))}")    // 1
+// ```
+pub fn high_half(t: PcapTimestamp) -> Int
+    todo("pcapfile-nv.pcapts.high_half")
+
+// The low 32 bits of a tick count, for a writer.
+//
+// ```novo
+// use pcapts
+//
+// fn main() [io]
+//     println("${pcapts.low_half(pcapts.timestamp(4294967296))}")     // 0
+// ```
+pub fn low_half(t: PcapTimestamp) -> Int
+    todo("pcapfile-nv.pcapts.low_half")
+
+// A Unix instant from whole seconds and nanoseconds.
+//
+// The constructor normalises nothing: `nanoseconds` outside 0 to
+// 999999999 is the caller's mistake, and `pcapts.from_unix` is where
+// it is refused.
+//
+// ```novo
+// use pcapts
+//
+// fn main() [io]
+//     println("${pcapts.unix_time(1700000000, 0).seconds}")
+// ```
+pub fn unix_time(seconds: Int, nanoseconds: Int) -> PcapUnixTime
+    todo("pcapfile-nv.pcapts.unix_time")
+
+// A tick count as a Unix instant, at a resolution and with an
+// interface's offset added.
+//
+// `offset_seconds` is the interface's `if_tsoffset`, which is zero
+// for a classic pcap file and zero for a pcapng interface that did
+// not set the option.  A resolution finer than a nanosecond is
+// TRUNCATED here, not rounded, so that converting an instant and
+// converting it back never moves it forward past a packet that came
+// after it.
+//
+// ```novo
+// use pcapts
+//
+// fn main() [io]
+//     let u = pcapts.to_unix(pcapts.timestamp(1700000000500000),
+//                            pcapts.micros(), 0)
+//     println("${u.seconds}")                      // 1700000000
+//     println("${u.nanoseconds}")                  // 500000000
+// ```
+pub fn to_unix(t: PcapTimestamp, r: PcapResolution, offset_seconds: Int) -> PcapUnixTime
+    todo("pcapfile-nv.pcapts.to_unix")
+
+// A Unix instant as a tick count, at a resolution and with an
+// interface's offset subtracted.
+//
+// `PcapUnwritable` when `nanoseconds` is outside 0 to 999999999, and
+// `PcapUnwritable` when the resulting count is negative — a capture
+// file has no way to write a timestamp before its own epoch.
+//
+// A resolution coarser than a nanosecond LOSES the remainder, and
+// `pcapts.is_exact` is what says so before the loss happens.
+//
+// ```novo
+// use pcapts
+//
+// fn main() [io]
+//     match pcapts.from_unix(pcapts.unix_time(1700000000, 500000000),
+//                            pcapts.micros(), 0)
+//         Ok(t)  => println("${pcapts.ticks(t)}")   // 1700000000500000
+//         Err(e) => println(e.message())
+// ```
+pub fn from_unix(u: PcapUnixTime, r: PcapResolution,
+                 offset_seconds: Int) -> Result<PcapTimestamp, PcapError>
+    todo("pcapfile-nv.pcapts.from_unix")
+
+// Whether an instant survives being written at this resolution and
+// read back unchanged.
+//
+// False when the nanoseconds are not a whole number of ticks: 500
+// nanoseconds at microsecond resolution is lost, and so is every odd
+// nanosecond at `PcapBinaryResolution(20)`.  A program rewriting a
+// nanosecond capture into a microsecond one asks this and reports
+// what it dropped, instead of dropping it quietly.
+//
+// ```novo
+// use pcapts
+//
+// fn main() [io]
+//     let u = pcapts.unix_time(1700000000, 500)
+//     println("${pcapts.is_exact(u, pcapts.micros())}")     // false
+//     println("${pcapts.is_exact(u, pcapts.nanos())}")      // true
+// ```
+pub fn is_exact(u: PcapUnixTime, r: PcapResolution) -> Bool
+    todo("pcapfile-nv.pcapts.is_exact")
+
+// A classic pcap record's two fields as a tick count.
+//
+// A classic record writes whole seconds and a fraction in separate
+// 32-bit fields, where the fraction is microseconds under the
+// 0xA1B2C3D4 magic and nanoseconds under 0xA1B23C4D.  This combines
+// them into the single count the rest of the package uses, so that a
+// classic packet and a pcapng packet carry the same kind of value.
+//
+// ```novo
+// use pcapts
+//
+// fn main() [io]
+//     let t = pcapts.from_classic(1700000000, 500000, pcapts.micros())
+//     println("${pcapts.ticks(t)}")                 // 1700000000500000
+// ```
+pub fn from_classic(seconds: Int, fraction: Int, r: PcapResolution) -> PcapTimestamp
+    todo("pcapfile-nv.pcapts.from_classic")
+
+// The whole-seconds field a classic record writes, for a writer.
+//
+// ```novo
+// use pcapts
+//
+// fn main() [io]
+//     let t = pcapts.timestamp(1700000000500000)
+//     println("${pcapts.classic_seconds(t, pcapts.micros())}")   // 1700000000
+// ```
+pub fn classic_seconds(t: PcapTimestamp, r: PcapResolution) -> Int
+    todo("pcapfile-nv.pcapts.classic_seconds")
+
+// The fraction field a classic record writes, for a writer.
+//
+// Microseconds under the microsecond magic and nanoseconds under the
+// nanosecond one, which is the same number of ticks either way.
+//
+// ```novo
+// use pcapts
+//
+// fn main() [io]
+//     let t = pcapts.timestamp(1700000000500000)
+//     println("${pcapts.classic_fraction(t, pcapts.micros())}")  // 500000
+// ```
+pub fn classic_fraction(t: PcapTimestamp, r: PcapResolution) -> Int
+    todo("pcapfile-nv.pcapts.classic_fraction")
